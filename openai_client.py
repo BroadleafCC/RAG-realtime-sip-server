@@ -1,0 +1,165 @@
+"""
+OpenAI Realtime API (GA) への WebSocket 接続ラッパー。
+
+既存プロジェクト（Twilio SIPトランク + Realtime "Call API"）とは異なり、
+call_id を使わないプレーンな Realtime WebSocket 接続。turn_detection は
+常に null（サーバー側VADを完全に無効化）にし、発話終了判定は自前の
+vad.py が行う。
+
+音声フォーマットの注意: GA版APIでは beta版のフラットな文字列
+`input_audio_format: "g711_ulaw"` は拒否される。ネスト形式の
+`{"type": "audio/pcmu"}` を仮説として採用しているが、これは実機未検証。
+Stage 1のngrokスモークテストで session.updated イベントの
+session.audio.input.format エコーバックを必ずログで確認すること
+（本ファイルの _log_session_echo がそれを行う）。
+"""
+import json
+import logging
+
+import websockets
+
+import config
+
+logger = logging.getLogger("openai_client")
+
+REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model={model}"
+
+# 高頻度で意味のないイベントはタイプ名のみログする（指示書の要件）
+HIGH_FREQUENCY_EVENT_TYPES = {
+    "response.audio_transcript.delta",
+    "response.output_audio_transcript.delta",
+    "response.output_audio.delta",
+    "response.text.delta",
+    "input_audio_buffer.append",
+}
+
+
+def build_session_update(instructions: str) -> dict:
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "instructions": instructions,
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcmu"},
+                    "noise_reduction": {"type": "far_field"},
+                    "turn_detection": None,
+                },
+                "output": {
+                    "format": {"type": "audio/pcmu"},
+                    "voice": "coral",
+                },
+            },
+        },
+    }
+
+
+def build_greeting_items() -> list[dict]:
+    """通話開始時、AIに最初のひとことを言わせるための conversation.item.create
+    + response.create のペア（既存main.pyのconversation_item_create/response_createを踏襲）"""
+    return [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "まず「お待たせしました。ご用件をうかがいます。」とだけ言ってください。",
+                    }
+                ],
+            },
+        },
+        {"type": "response.create"},
+    ]
+
+
+def build_text_item(text: str) -> list[dict]:
+    """既存main.pyの timeout_item/goodbye_item/retry_item パターンを一般化した
+    ヘルパー。system扱いのuserメッセージを1件挿入し、応答を生成させる。"""
+    return [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        },
+        {"type": "response.create"},
+    ]
+
+
+class OpenAiRealtimeSocket:
+    def __init__(self, model: str | None = None):
+        self.model = model or config.OPENAI_REALTIME_MODEL
+        self._ws: websockets.WebSocketClientProtocol | None = None
+
+    async def connect(self):
+        url = REALTIME_WS_URL.format(model=self.model)
+        self._ws = await websockets.connect(
+            url,
+            additional_headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+            ping_interval=10,
+            ping_timeout=5,
+        )
+        return self
+
+    async def close(self):
+        if self._ws is not None:
+            await self._ws.close()
+
+    async def _send(self, payload: dict):
+        await self._ws.send(json.dumps(payload))
+
+    async def send_session_update(self, instructions: str):
+        await self._send(build_session_update(instructions))
+
+    async def send_greeting(self):
+        for item in build_greeting_items():
+            await self._send(item)
+
+    async def send_text_turn(self, text: str):
+        for item in build_text_item(text):
+            await self._send(item)
+
+    async def append_audio(self, payload_b64: str):
+        await self._send({"type": "input_audio_buffer.append", "audio": payload_b64})
+
+    async def commit(self):
+        await self._send({"type": "input_audio_buffer.commit"})
+
+    async def response_create(self):
+        await self._send({"type": "response.create"})
+
+    async def response_cancel(self, response_id: str | None = None):
+        payload = {"type": "response.cancel"}
+        if response_id:
+            payload["response_id"] = response_id
+        await self._send(payload)
+
+    async def recv_events(self):
+        async for message in self._ws:
+            event = json.loads(message)
+            event_type = event.get("type", "")
+            if event_type in HIGH_FREQUENCY_EVENT_TYPES:
+                logger.debug("[OA EVENT] %s", event_type)
+            else:
+                logger.info("[OA EVENT] %s", event_type)
+            yield event
+
+
+def log_session_echo(event: dict):
+    """session.created / session.updated 受信時に呼ぶ。GA版フォーマット仮説
+    (audio/pcmu, turn_detection=null) が実機でそのまま通っているかを確認する。"""
+    session = event.get("session", {}) or {}
+    audio = session.get("audio", {}) or {}
+    input_audio = audio.get("input", {}) or {}
+    logger.info(
+        "[SESSION ECHO] type=%s format=%s turn_detection=%s",
+        event.get("type"),
+        input_audio.get("format"),
+        input_audio.get("turn_detection"),
+    )

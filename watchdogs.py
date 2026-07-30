@@ -1,0 +1,132 @@
+"""
+3つの独立したタイムアウト監視ループ。
+
+指示書の核心的な要件：既存main.pyでは無音タイムアウト判定がVAD状態の
+elifチェーンに巻き込まれて動かなくなるバグがあった。ここでは
+silence_watchdog / max_duration_watchdog / response_watchdog を互いに
+状態を参照しない独立した asyncio タスクとして実装し、構造的に再発を防ぐ。
+
+いずれかが `CallEnded` を送出すると、call_session.py の TaskGroup が
+他の全タスクを道連れにキャンセルする（`except* CallEnded` で正常終了扱い）。
+"""
+import asyncio
+import logging
+import time
+
+import call_logger
+import config
+import salesforce_case
+import twilio_client
+from vad import VadState
+
+logger = logging.getLogger("watchdogs")
+
+SILENCE_TIMEOUT_MESSAGE = "【無音タイムアウト】"
+MAX_DURATION_MESSAGE = "【最大通話時間超過】"
+ESCALATION_PHRASE = (
+    "お電話が遠いようで、うまく聞き取れませんでした。"
+    "この番号に最も近い担当者から改めてご連絡いたしますので、恐れ入りますが一度お電話をお切りください。"
+)
+
+
+class CallEnded(Exception):
+    """いずれかの監視ループ/イベントハンドラが通話終了を決定したときに送出する。
+    自分自身のhangup処理は送出前に完了させておくこと。"""
+
+
+async def _say_and_wait_for_goodbye(session, text: str, wait_timeout: float = 15.0):
+    """conversation.item.create + response.create でフレーズを言わせ、
+    output_audio_buffer.stopped（=goodbye_event）を待つ。OpenAI接続が
+    死んでいる場合でも例外を握りつぶして先に進む（hangupは必ず行う）。"""
+    session.is_goodbye = True
+    try:
+        await session.openai.send_text_turn(text)
+    except Exception as e:
+        logger.warning("[WATCHDOG] フレーズ送信に失敗しました（続行します）: %s", e)
+        return
+    try:
+        await asyncio.wait_for(session.goodbye_event.wait(), timeout=wait_timeout)
+    except asyncio.TimeoutError:
+        logger.warning("[WATCHDOG] goodbye再生の完了を待てませんでした（続行します）")
+
+
+async def silence_watchdog(session):
+    """挨拶完了後・AI非発話中・IDLE状態で SILENCE_TIMEOUT_SEC 秒経過したら切断する。
+    他のどの状態にも依存しない独立ループ。"""
+    while True:
+        await asyncio.sleep(1)
+
+        if not session.greeting_done or session.ai_is_speaking:
+            continue
+        if session.turn_detector.state != VadState.IDLE:
+            continue
+        if session.last_user_speech_time is None:
+            continue
+
+        elapsed = time.monotonic() - session.last_user_speech_time
+        if elapsed < config.SILENCE_TIMEOUT_SEC:
+            continue
+
+        logger.info("[SILENCE] %s秒間無言のため通話を切断します", config.SILENCE_TIMEOUT_SEC)
+        session.transcript_lines.append("(無言タイムアウトのため通話を切断しました)")
+        await _say_and_wait_for_goodbye(session, SILENCE_TIMEOUT_MESSAGE)
+        twilio_client.hangup_call(session.call_sid)
+        call_logger.log_event(session.call_sid, session.caller_number, 'silence_timeout', 'SUCCESS')
+        raise CallEnded("silence_timeout")
+
+
+async def max_duration_watchdog(session):
+    """MAX_CALL_DURATION_SEC 秒で状態に関わらず強制的に切断する。
+    他のどの状態にも依存しない、最も単純な独立ループ。"""
+    await asyncio.sleep(config.MAX_CALL_DURATION_SEC)
+
+    logger.info("[MAX DURATION] 最大通話時間 %s秒 に達したため切断します", config.MAX_CALL_DURATION_SEC)
+    session.transcript_lines.append(f"(最大通話時間 {config.MAX_CALL_DURATION_SEC}秒 に達したため切断しました)")
+    await _say_and_wait_for_goodbye(session, MAX_DURATION_MESSAGE)
+    twilio_client.hangup_call(session.call_sid)
+    call_logger.log_event(session.call_sid, session.caller_number, 'max_duration', 'SUCCESS')
+    raise CallEnded("max_duration")
+
+
+async def response_watchdog(session):
+    """commit + response.create 送信後、応答が始まらない場合の縮退運転。
+    5秒でresponse.createのみ再送（commitは再送しない＝空バッファエラー回避）、
+    さらに5秒（計10秒）で縮退運転フレーズ→hangup→即座にSalesforceケース作成
+    （案内なしで通話が終わっても発信元番号を絶対に落とさないための最優先経路）。
+    """
+    while True:
+        await asyncio.sleep(1)
+
+        if session.response_deadline is None:
+            continue
+        if time.monotonic() < session.response_deadline:
+            continue
+
+        if session.response_watchdog_stage == 0:
+            logger.warning("[WATCHDOG] 5秒応答なし。response.createを再送します")
+            session.response_watchdog_stage = 1
+            session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_SECOND_SEC
+            try:
+                await session.openai.response_create()
+            except Exception as e:
+                logger.warning("[WATCHDOG] response.create再送に失敗: %s", e)
+            continue
+
+        logger.error("[WATCHDOG] 応答ウォッチドッグ縮退運転を開始します（OpenAI応答なし）")
+        session.transcript_lines.append("(応答が届かないため縮退運転に切り替えました)")
+        await _say_and_wait_for_goodbye(session, ESCALATION_PHRASE, wait_timeout=8.0)
+        twilio_client.hangup_call(session.call_sid)
+
+        await asyncio.to_thread(
+            salesforce_case.create_salesforce_case,
+            session.transcript_lines,
+            session.call_sid,
+            session.caller_number,
+            True,
+        )
+        session.case_created = True
+        call_logger.log_event(
+            session.call_sid, session.caller_number,
+            'response_watchdog_escalation', 'FAILURE', 'OpenAIから応答が届きませんでした',
+        )
+        raise CallEnded("response_watchdog_escalation")

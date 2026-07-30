@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+websockets
+python-dotenv
+requests
+simple-salesforce
+twilio
+openai
+onnxruntime
+silero-vad-notorch
+audioop-lts
+numpy
