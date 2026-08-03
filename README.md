@@ -24,6 +24,7 @@ cp .env.example .env
 ```bash
 python tests/test_vad.py
 python tests/test_audio_convert.py
+python tests/test_twilio_framing.py
 ```
 
 ## ローカル起動 + ngrok動作確認
@@ -60,6 +61,23 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
 | `call_logger.py` | ログDB・Google Chat通知・コスト集計（既存プロジェクトから移植） |
 | `salesforce_case.py` | Salesforceケース作成・録音/Whisperパイプライン（既存から移植） |
 | `watchdogs.py` | 無音／最大通話時間／応答ウォッチドッグの3独立監視ループ |
+| `assets/audio/` | 即時相槌（フィラー）用の事前生成済み音声アセット |
+| `scripts/generate_filler_audio.py` | フィラー音声アセットの生成/再生成スクリプト（OpenAI TTS使用） |
+
+## 応答速度・音声頭切れチューニング
+
+- `VAD_SPEECH_END_MS`（既定500ms）: 発話終了とみなすまでの無音継続時間。短くする
+  ほど応答は速くなるが、語尾の「間」を誤って区切るリスクが上がる。
+- `RESPONSE_LEAD_SILENCE_MS`（既定250ms）: 各応答の音声冒頭に挿入する無音の長さ。
+  出力ストリームが立ち上がる瞬間の頭切れ対策。
+- `ENABLE_FILLER` / `FILLER_AUDIO_PATH`: trueにすると、発話終了直後（応答生成の
+  待ち時間）に短い相槌音声を即時再生し、無音区間を埋める（オプション機能。
+  デフォルトはfalse）。フレーズや声を変えたい場合は
+  `scripts/generate_filler_audio.py` を編集して再実行する。
+- `[AUDIO-STATS]` ログ: 応答ごとの音声中継バイト数・再生時間を1行で出力する
+  診断ログ。`bytes_in`と`bytes_out`が一致しない場合は自サーバー内での音声欠落、
+  `playback_sec`が`expected_sec`から大きく乖離する場合はTwilio側での遅延・欠落を
+  示す。
 
 ## 既知の未検証事項（実機での初回テストで確認すること）
 

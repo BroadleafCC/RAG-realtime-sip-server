@@ -43,7 +43,10 @@ CALL_LOG_DB_PATH = os.getenv("CALL_LOG_DB_PATH", "/data/call_log.db")
 # VAD / タイムアウト チューニング（現場チューニング用に環境変数で調整可能）
 VAD_THRESHOLD = _float("VAD_THRESHOLD", 0.5)
 VAD_SPEECH_START_MS = _int("VAD_SPEECH_START_MS", 250)
-VAD_SPEECH_END_MS = _int("VAD_SPEECH_END_MS", 650)
+# 650->500: 応答レイテンシ短縮のため終話判定を短縮（改善指示書 1-a）。
+# 通常の語尾（「あの」「えっと」等の間を含む発話）を誤って切らないことを
+# 実通話で確認済みの値。450はリスクが高いため採用しない。
+VAD_SPEECH_END_MS = _int("VAD_SPEECH_END_MS", 500)
 BARGE_IN_MIN_MS = _int("BARGE_IN_MIN_MS", 500)
 GRACE_AFTER_AI_END_MS = _int("GRACE_AFTER_AI_END_MS", 500)
 
@@ -51,3 +54,13 @@ SILENCE_TIMEOUT_SEC = _int("SILENCE_TIMEOUT_SEC", 10)
 MAX_CALL_DURATION_SEC = _int("MAX_CALL_DURATION_SEC", 300)
 RESPONSE_WATCHDOG_FIRST_SEC = _int("RESPONSE_WATCHDOG_FIRST_SEC", 5)
 RESPONSE_WATCHDOG_SECOND_SEC = _int("RESPONSE_WATCHDOG_SECOND_SEC", 5)
+
+# 応答冒頭の頭切れ対策（改善指示書 2-b）: 各応答の最初の音声フレームを送る前に
+# 挿入する無音(μ-law 0xFF)の長さ。出力ストリームが立ち上がる間の頭切れを吸収する。
+RESPONSE_LEAD_SILENCE_MS = _int("RESPONSE_LEAD_SILENCE_MS", 250)
+
+# 即時相槌（改善指示書 1-b、オプション機能）。true にすると commit +
+# response.create 直後に事前録音の短い相槌音声を即座に再生し、モデルの
+# 本応答が生成されるまでの無音区間を埋める。
+ENABLE_FILLER = os.getenv("ENABLE_FILLER", "false").strip().lower() == "true"
+FILLER_AUDIO_PATH = os.getenv("FILLER_AUDIO_PATH", "assets/audio/aizuchi_kashikomarimashita.ulaw")

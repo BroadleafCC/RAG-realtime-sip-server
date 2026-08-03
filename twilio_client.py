@@ -5,8 +5,10 @@ Twilio REST API 操作 + Media Streams の outbound フレーム構築。
 （`POST /v1/realtime/calls/{call_id}/hangup`）、本プロジェクトのトランスポート
 には call_id が存在しないため、Twilio REST API 経由の通話終了に置き換える。
 """
+import base64
 import json
 import logging
+import math
 
 from twilio.rest import Client as TwilioClient
 
@@ -15,6 +17,48 @@ import config
 logger = logging.getLogger("twilio_client")
 
 _client: TwilioClient | None = None
+
+# Twilio Media Streamsが前提とする1フレームのサイズ（20ms分のμ-law 8kHz = 160byte）。
+# OpenAIから届くdeltaは可変長のため、この単位に詰め直してから送信する
+# （改善指示書2-a: deltaとフレームの境界がズレることによる音声頭切れ対策）。
+FRAME_BYTES = 160
+SILENCE_BYTE = b"\xff"  # μ-lawの無音相当バイト
+
+
+class FrameAligner:
+    """OpenAIから届く可変長の音声deltaを、20ms(160byte)単位のフレームに詰め直す。
+
+    deltaの境界とフレームの境界がズレて音声の一部が失われる問題（改善指示書2-a）
+    を避けるため、端数は内部バッファに保持して次のdeltaへ跨がせる。応答（response）
+    ごとに新しいインスタンスを使うこと（呼び出し側でresponse.created時に作り直す）。
+    """
+
+    def __init__(self, frame_bytes: int = FRAME_BYTES):
+        self.frame_bytes = frame_bytes
+        self._buf = bytearray()
+
+    def push(self, data: bytes) -> list[bytes]:
+        """dataを取り込み、確定した160byteフレームのリストを返す。端数は次回に持ち越す。"""
+        self._buf.extend(data)
+        frames = []
+        while len(self._buf) >= self.frame_bytes:
+            frames.append(bytes(self._buf[:self.frame_bytes]))
+            del self._buf[:self.frame_bytes]
+        return frames
+
+    def flush(self) -> tuple[bytes, int] | None:
+        """応答終端で残った端数を無音パディングして返す。
+
+        戻り値は (パディング済みフレーム, 実データのバイト数)。端数がなければNone。
+        実データ長を分けて返すのは、呼び出し側がbytes_out統計にパディング分を
+        含めずに集計できるようにするため（改善指示書2-c）。
+        """
+        if not self._buf:
+            return None
+        real_len = len(self._buf)
+        frame = bytes(self._buf) + SILENCE_BYTE * (self.frame_bytes - real_len)
+        self._buf.clear()
+        return frame, real_len
 
 
 def _get_client() -> TwilioClient:
@@ -49,6 +93,30 @@ async def send_media(ws, stream_sid: str, payload_b64: str):
         "streamSid": stream_sid,
         "media": {"payload": payload_b64},
     }))
+
+
+async def send_media_bytes(ws, stream_sid: str, raw: bytes):
+    """生のμ-lawバイト列をbase64化してTwilioへ送る（send_mediaの生バイト版）。"""
+    await send_media(ws, stream_sid, base64.b64encode(raw).decode("ascii"))
+
+
+async def send_lead_silence(ws, stream_sid: str, duration_ms: int):
+    """応答音声冒頭の頭切れ対策（改善指示書2-b）。
+
+    各応答の最初の実音声フレームを送る前に、指定ms分のμ-law無音フレームを
+    送っておく。出力ストリームが立ち上がる瞬間の頭切れを、無音部分に吸収させる
+    のが狙い。この無音分はmark待ち時間・再生時間の計算（bytes_out集計）には
+    含めない（呼び出し側で別カウントする）。
+    """
+    if duration_ms <= 0:
+        return
+    frame_ms = 20
+    # 切り上げる（切り捨て/四捨五入だと指定msを下回る可能性があり、
+    # 頭切れ対策という目的上「最低でも指定ms」を保証したいため）。
+    n_frames = max(1, math.ceil(duration_ms / frame_ms))
+    silence = SILENCE_BYTE * FRAME_BYTES
+    for _ in range(n_frames):
+        await send_media_bytes(ws, stream_sid, silence)
 
 
 async def send_clear(ws, stream_sid: str):

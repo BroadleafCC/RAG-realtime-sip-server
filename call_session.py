@@ -15,6 +15,7 @@ import base64
 import json
 import logging
 import time
+from dataclasses import dataclass
 
 from starlette.websockets import WebSocketDisconnect
 
@@ -29,6 +30,56 @@ from vad import TurnDetector, VadEvent, VadState
 from vad_model import SileroVad
 
 logger = logging.getLogger("call_session")
+
+# 相槌（ENABLE_FILLER=true時）の直後にモデルが同じ相槌を言い直して二重発声する
+# のを防ぐための追加ルール。プロンプトDBの内容に関わらず、フィラー機能が有効な
+# 場合のみ instructions の末尾に付け足す（改善指示書1-b）。
+FILLER_ANTI_DOUBLE_SPEECH_NOTICE = (
+    "\n\n【システム注記】ユーザーの発話終了直後に短い相槌（「かしこまりました」）が"
+    "自動再生されています。あなたの応答をこの相槌の繰り返しから始めないでください。"
+    "相槌は言い終えたものとして扱い、続きの内容から話し始めてください。"
+)
+
+_filler_audio_cache: bytes | None = None
+
+
+def _load_filler_audio() -> bytes:
+    """フィラー音声（μ-law 8kHz生データ）をファイルから読み込み、プロセス内で
+    キャッシュする。ファイルが無い/読めない場合は空バイト列を返し、呼び出し側は
+    フィラー再生を静かにスキップする（通話を止めない）。"""
+    global _filler_audio_cache
+    if _filler_audio_cache is not None:
+        return _filler_audio_cache
+    try:
+        with open(config.FILLER_AUDIO_PATH, "rb") as f:
+            _filler_audio_cache = f.read()
+        logger.info(
+            "[FILLER] 音声ファイルを読み込みました path=%s bytes=%d",
+            config.FILLER_AUDIO_PATH, len(_filler_audio_cache),
+        )
+    except OSError as e:
+        logger.warning(
+            "[FILLER] 音声ファイルを読み込めませんでした path=%s err=%s（フィラー再生をスキップします）",
+            config.FILLER_AUDIO_PATH, e,
+        )
+        _filler_audio_cache = b""
+    return _filler_audio_cache
+
+
+if config.ENABLE_FILLER:
+    _load_filler_audio()  # 起動時に一度読み込み、通話中の初回再生での遅延を避ける
+
+
+@dataclass
+class _AudioStats:
+    """1応答ぶんの音声中継の診断カウンタ（改善指示書2-c）。response.created時に
+    作り直し、電話口での再生完了（mark受信）時に一度だけログ出力する。"""
+    resp_id: str | None = None
+    deltas: int = 0
+    bytes_in: int = 0
+    bytes_out: int = 0
+    first_delta_bytes: int | None = None
+    first_frame_sent_at: float | None = None
 
 
 class CallSession:
@@ -53,6 +104,12 @@ class CallSession:
         self.silero = SileroVad()
         self.openai: OpenAiRealtimeSocket | None = None
         self._response_id: str | None = None
+
+        # 応答音声のフレーム整形・頭切れ対策・診断ログ用の状態（改善指示書2章）。
+        # response.created を受けるたびに作り直す（pump_openai_to_twilio参照）。
+        self._frame_aligner = twilio_client.FrameAligner()
+        self._lead_silence_sent = False
+        self._audio_stats = _AudioStats()
 
         # Twilio markによる「電話口での実際の再生完了」トラッキング用。
         # response.doneはサーバー側の音声生成完了でしかなく、Realtime APIは
@@ -92,7 +149,10 @@ async def run(twilio_ws):
 
     try:
         session.openai = await OpenAiRealtimeSocket().connect()
-        await session.openai.send_session_update(call_logger.get_prompt(call_logger.DEFAULT_INSTRUCTIONS))
+        instructions = call_logger.get_prompt(call_logger.DEFAULT_INSTRUCTIONS)
+        if config.ENABLE_FILLER:
+            instructions += FILLER_ANTI_DOUBLE_SPEECH_NOTICE
+        await session.openai.send_session_update(instructions)
         await session.openai.send_greeting()
         call_logger.log_event(session.call_sid, session.caller_number, 'ws_connected', 'SUCCESS')
 
@@ -172,6 +232,7 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                 # （もう1つの起点はVADのSPEECH_STARTED）。
                 session._pending_mark_name = None
                 session.ai_is_speaking = False
+                _log_audio_stats(session, mark_name)
                 _refresh_silence_eligibility(session, reason="mark")
                 logger.info("[MARK] name=%s 応答完了", mark_name)
                 if session.is_goodbye and mark_name.startswith("goodbye_"):
@@ -184,6 +245,27 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
         elif event == "stop":
             raise watchdogs.CallEnded("twilio_stop")
         # 'connected'（再送されうる）や未知イベントは無視する
+
+
+def _log_audio_stats(session: CallSession, mark_name: str) -> None:
+    """応答1件ぶんの音声中継の診断ログ（改善指示書2-c）。電話口での再生完了
+    （mark受信）時に一度だけ出力する。bytes_in != bytes_out は自サーバー内で
+    音声が欠落したことを、playback_sec が expected_sec から大きくズレることは
+    Twilio側での欠落・遅延を示す。"""
+    stats = session._audio_stats
+    if stats.deltas == 0:
+        return  # このmarkに対応する応答でOpenAI音声を受信していない（相槌のみ等）
+    expected_sec = stats.bytes_out / 8000.0
+    if stats.first_frame_sent_at is not None:
+        playback_sec = f"{time.monotonic() - stats.first_frame_sent_at:.3f}"
+    else:
+        playback_sec = "n/a"
+    logger.info(
+        "[AUDIO-STATS] resp_id=%s mark=%s deltas=%d bytes_in=%d bytes_out=%d "
+        "first_delta_bytes=%s playback_sec=%s expected_sec=%.3f",
+        stats.resp_id, mark_name, stats.deltas, stats.bytes_in, stats.bytes_out,
+        stats.first_delta_bytes, playback_sec, expected_sec,
+    )
 
 
 def _refresh_silence_eligibility(session: CallSession, reason: str | None = None) -> None:
@@ -215,6 +297,12 @@ async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
         await session.openai.response_create()
         session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
         session.response_watchdog_stage = 0
+        if config.ENABLE_FILLER:
+            # モデルの応答音声が生成されるまでの無音区間を埋める即時相槌
+            # （改善指示書1-b）。AWAITING_RESPONSE中はVAD状態機械が確率で
+            # 遷移しない（vad.py参照）ため、この再生はVAD/バージイン判定に
+            # 一切影響しない。
+            await _play_filler(session, twilio_ws)
 
     elif event == VadEvent.BARGE_IN:
         await session.openai.response_cancel(session._response_id)
@@ -226,7 +314,30 @@ async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
         # 破棄されたキューぶんのmarkがTwilioから遅れて返ってきても
         # 二重処理しないよう、待機中のmark名を無効化しておく。
         session._pending_mark_name = None
+        # 中断された応答は正常なmark経路を通らないため、ここで診断ログを
+        # 出しておく（改善指示書2-c）。
+        stats = session._audio_stats
+        if stats.deltas:
+            logger.info(
+                "[AUDIO-STATS] resp_id=%s barge_in=True deltas=%d bytes_in=%d bytes_out=%d",
+                stats.resp_id, stats.deltas, stats.bytes_in, stats.bytes_out,
+            )
         _refresh_silence_eligibility(session)
+
+
+async def _play_filler(session: CallSession, twilio_ws) -> None:
+    """事前録音の短い相槌音声をTwilioへ即座に送る（改善指示書1-b）。
+    OpenAIの音声パス（_audio_stats/_frame_aligner）とは完全に独立させる
+    （フィラーは診断対象の「OpenAI→Twilio中継」には含めない）。"""
+    data = _load_filler_audio()
+    if not data:
+        return
+    for i in range(0, len(data), twilio_client.FRAME_BYTES):
+        chunk = data[i:i + twilio_client.FRAME_BYTES]
+        if len(chunk) < twilio_client.FRAME_BYTES:
+            chunk = chunk + twilio_client.SILENCE_BYTE * (twilio_client.FRAME_BYTES - len(chunk))
+        await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, chunk)
+    logger.info("[FILLER] 相槌音声を再生しました bytes=%d", len(data))
 
 
 async def pump_openai_to_twilio(session: CallSession, twilio_ws):
@@ -241,6 +352,11 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
             session._response_id = (
                 response_obj.get("id") if isinstance(response_obj, dict) else None
             ) or event.get("response_id") or event.get("id")
+            # 応答ごとにフレーム整形バッファ・頭切れ対策フラグ・診断カウンタを
+            # 作り直す（改善指示書2章）。
+            session._frame_aligner = twilio_client.FrameAligner()
+            session._lead_silence_sent = False
+            session._audio_stats = _AudioStats(resp_id=session._response_id)
 
         elif event_type == "response.done":
             session.turn_detector.force_idle()
@@ -260,9 +376,42 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
         elif event_type == "response.output_audio.delta":
             audio_b64 = event.get("delta", "")
             if audio_b64:
-                await twilio_client.send_media(twilio_ws, session.stream_sid, audio_b64)
+                raw = base64.b64decode(audio_b64)
+                stats = session._audio_stats
+                stats.deltas += 1
+                stats.bytes_in += len(raw)
+                if stats.first_delta_bytes is None:
+                    stats.first_delta_bytes = len(raw)
+
+                if not session._lead_silence_sent:
+                    # この応答で最初の音声が来た瞬間、実フレームの前に無音を
+                    # 挟んで頭切れを吸収する（改善指示書2-b）。
+                    await twilio_client.send_lead_silence(
+                        twilio_ws, session.stream_sid, config.RESPONSE_LEAD_SILENCE_MS
+                    )
+                    session._lead_silence_sent = True
+
+                # deltaの境界とTwilioフレーム境界のズレによる欠落を防ぐため、
+                # 20ms(160byte)単位に詰め直してから送信する（改善指示書2-a）。
+                for frame in session._frame_aligner.push(raw):
+                    if stats.first_frame_sent_at is None:
+                        stats.first_frame_sent_at = time.monotonic()
+                    stats.bytes_out += len(frame)
+                    await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, frame)
 
         elif event_type == "response.output_audio.done":
+            # フレーム整形バッファに残った端数（160byte未満）を無音パディング
+            # して送り切る。ここで捨てると応答末尾が欠落するため、必ずflushする
+            # （改善指示書2-a）。パディング分はbytes_out統計に含めない。
+            tail = session._frame_aligner.flush()
+            if tail is not None:
+                tail_frame, real_len = tail
+                stats = session._audio_stats
+                if stats.first_frame_sent_at is None:
+                    stats.first_frame_sent_at = time.monotonic()
+                stats.bytes_out += real_len
+                await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, tail_frame)
+
             # この応答の音声フレームはすべてTwilioへ送信済み。ただし
             # Twilioの電話口での再生はまだ完了していない可能性が高い
             # （Realtime APIは実時間より速く音声を生成するため）。
