@@ -42,7 +42,7 @@ CLIPS = [
     {
         "name": "挨拶",
         "text": GREETING_TEXT,
-        "speed": 1.0,  # 通話冒頭の第一声なので落ち着いたトーンにする
+        "speed": 1.3,  # 3.3秒は間延びして聞こえたため、2.5秒程度になるよう早める
         "output": "greeting_o_matase.ulaw",
     },
     {
