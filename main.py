@@ -27,6 +27,7 @@ logger = logging.getLogger("main")
 async def lifespan(app: FastAPI):
     call_logger.init_db()
     call_logger.cleanup_old_logs()
+    call_session.preload_static_clips()
     yield
 
 
@@ -40,10 +41,16 @@ async def health():
 
 @app.post("/voice")
 async def voice(request: Request):
-    """Twilioの着信Voice webhook。Media Streamsへ接続させるTwiMLを返す。"""
+    """Twilioの着信Voice webhook。Media Streamsへ接続させるTwiMLを返す。
+
+    OpenAI WebSocket接続の確立はここで前倒しして裏で開始する（Media Stream
+    の`start`受信を待たない）。TwiML返却はブロックせず即座に行う（改善指示書
+    「挨拶即時再生」3・4章）。
+    """
     host = request.headers.get("host", config.RAILWAY_PUBLIC_DOMAIN)
     form = await request.form()
     caller = form.get("From", "")
+    call_session.prewarm_openai_connection(form.get("CallSid", ""))
     stream_url = f"wss://{host}/media-stream"
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>

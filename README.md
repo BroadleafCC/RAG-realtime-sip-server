@@ -25,6 +25,7 @@ cp .env.example .env
 python tests/test_vad.py
 python tests/test_audio_convert.py
 python tests/test_twilio_framing.py
+python tests/test_call_session_prewarm.py
 ```
 
 ## ローカル起動 + ngrok動作確認
@@ -61,8 +62,8 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
 | `call_logger.py` | ログDB・Google Chat通知・コスト集計（既存プロジェクトから移植） |
 | `salesforce_case.py` | Salesforceケース作成・録音/Whisperパイプライン（既存から移植） |
 | `watchdogs.py` | 無音／最大通話時間／応答ウォッチドッグの3独立監視ループ |
-| `assets/audio/` | 即時相槌（フィラー）用の事前生成済み音声アセット |
-| `scripts/generate_filler_audio.py` | フィラー音声アセットの生成/再生成スクリプト（OpenAI TTS使用） |
+| `assets/audio/` | 挨拶・即時相槌・縮退運転案内の事前生成済み音声アセット |
+| `scripts/generate_static_clips.py` | 上記音声アセットの生成/再生成スクリプト（OpenAI TTS使用） |
 
 ## 応答速度・音声頭切れチューニング
 
@@ -73,11 +74,37 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
 - `ENABLE_FILLER` / `FILLER_AUDIO_PATH`: trueにすると、発話終了直後（応答生成の
   待ち時間）に短い相槌音声を即時再生し、無音区間を埋める（オプション機能。
   デフォルトはfalse）。フレーズや声を変えたい場合は
-  `scripts/generate_filler_audio.py` を編集して再実行する。
+  `scripts/generate_static_clips.py` を編集して再実行する。
 - `[AUDIO-STATS]` ログ: 応答ごとの音声中継バイト数・再生時間を1行で出力する
   診断ログ。`bytes_in`と`bytes_out`が一致しない場合は自サーバー内での音声欠落、
   `playback_sec`が`expected_sec`から大きく乖離する場合はTwilio側での遅延・欠落を
   示す。
+
+## 受話直後の無音解消・挨拶の即時再生
+
+挨拶（「お待たせしました。ご用件を伺います。」）は毎回同じ定型文のため、
+モデルに生成させず事前生成クリップとして即時再生する。OpenAI WebSocket接続も
+Media Streamの`start`受信を待たず `/voice` webhook受信時点で前倒しして裏で
+開始しておく（`call_session.prewarm_openai_connection`）。
+
+- 呼び出し順序: `/voice` webhook受信 → OpenAI接続・録音開始RESTを裏で並行
+  開始 → TwiML即時返却 → Media Stream `start`受信 → 挨拶クリップ即時再生
+  → （並行して）プリウォームされたOpenAI接続を回収
+- `start`受信〜OpenAI session.updated完了までに届いたユーザー音声は
+  `CallSession._pending_audio_queue` にローカルキューし、接続完了後に
+  まとめて送る。VAD解析自体は接続状態と無関係にフレーム到着時点で行う
+  （キュー中に発話終了を検知した場合は`_deferred_end_of_speech`を立て、
+  接続完了直後にcommit+response.createする）
+- 挨拶は「モデルに言わせる」のではなく、session.updated後に
+  `conversation.item.create`（role=assistant）で会話履歴に注入するだけで
+  response.createは送らない。これにより次のresponseはユーザー発話のcommit
+  後にのみ発生する
+- `OPENAI_CONNECT_TIMEOUT_SEC`（既定5秒）以内にOpenAI接続が完了しない場合は
+  縮退運転に切り替える: `DEGRADED_AUDIO_PATH`の案内クリップ再生→切電→
+  要折り返しフラグ付きSalesforceケース作成→Google Chat通知
+- ログ: `[GREETING] start受信からクリップ送信まで=XXms`、
+  `[OA-CONNECT] webhook起点=XXms start起点=XXms (session.updated完了まで)`、
+  `[QUEUE] flush frames=N (XXms分)` で各段階の所要時間を追える
 
 ## 既知の未検証事項（実機での初回テストで確認すること）
 
@@ -87,3 +114,9 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
   確認すること
 - `response.output_audio.delta` というイベント名も同様に未検証（このトランス
   ポートでの音声中継は既存プロジェクトに前例がなく完全新規実装のため）
+- 挨拶を会話履歴に注入する`conversation.item.create`（role=assistant）の
+  contentタイプを`"text"`と仮定している（`openai_client.build_greeting_said_item`）。
+  GA版の最新ドキュメントで`"output_text"`等に変わっていないか確認すること。
+  誤っている場合はitem作成がエラーになるか無視されるかのいずれかなので、
+  `[OA EVENT] error` ログの有無と、モデルが挨拶を意識できているか
+  （挨拶を繰り返さないか）で判別できる

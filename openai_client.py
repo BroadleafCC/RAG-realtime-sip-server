@@ -55,25 +55,24 @@ def build_session_update(instructions: str) -> dict:
     }
 
 
-def build_greeting_items() -> list[dict]:
-    """通話開始時、AIに最初のひとことを言わせるための conversation.item.create
-    + response.create のペア（既存main.pyのconversation_item_create/response_createを踏襲）"""
-    return [
-        {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "まず「お待たせしました。ご用件をうかがいます。」とだけ言ってください。",
-                    }
-                ],
-            },
+# 挨拶は事前生成済みのμ-lawクリップとして即時再生する（call_session.py参照）。
+# ここではモデルに「言わせる」のではなく、既に言い終えたものとして会話履歴に
+# 注入するためのテキストを定義する（改善指示書「挨拶即時再生」2章）。
+GREETING_TEXT = "お待たせしました。ご用件を伺います。"
+
+
+def build_greeting_said_item() -> dict:
+    """挨拶を会話履歴にassistant発言として注入するconversation.item.create。
+    response.createは送らない（次のresponseはユーザー発話のcommit後に発生する）。
+    """
+    return {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": GREETING_TEXT}],
         },
-        {"type": "response.create"},
-    ]
+    }
 
 
 def build_text_item(text: str) -> list[dict]:
@@ -117,9 +116,8 @@ class OpenAiRealtimeSocket:
     async def send_session_update(self, instructions: str):
         await self._send(build_session_update(instructions))
 
-    async def send_greeting(self):
-        for item in build_greeting_items():
-            await self._send(item)
+    async def inject_greeting_said(self):
+        await self._send(build_greeting_said_item())
 
     async def send_text_turn(self, text: str):
         for item in build_text_item(text):

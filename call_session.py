@@ -25,7 +25,7 @@ import salesforce_case
 import twilio_client
 import watchdogs
 from audio_convert import ulaw_to_pcm16
-from openai_client import OpenAiRealtimeSocket, log_session_echo
+from openai_client import GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
 from vad import TurnDetector, VadEvent, VadState
 from vad_model import SileroVad
 
@@ -40,34 +40,58 @@ FILLER_ANTI_DOUBLE_SPEECH_NOTICE = (
     "相槌は言い終えたものとして扱い、続きの内容から話し始めてください。"
 )
 
-_filler_audio_cache: bytes | None = None
+_clip_cache: dict[str, bytes] = {}
 
 
-def _load_filler_audio() -> bytes:
-    """フィラー音声（μ-law 8kHz生データ）をファイルから読み込み、プロセス内で
-    キャッシュする。ファイルが無い/読めない場合は空バイト列を返し、呼び出し側は
-    フィラー再生を静かにスキップする（通話を止めない）。"""
-    global _filler_audio_cache
-    if _filler_audio_cache is not None:
-        return _filler_audio_cache
+def _load_static_clip(path: str) -> bytes:
+    """事前生成済みの音声クリップ（μ-law 8kHz生データ）をパスごとにキャッシュ
+    して読み込む。ファイルが無い/読めない場合は空バイト列を返し、呼び出し側は
+    再生を静かにスキップする（通話を止めない）。"""
+    if path in _clip_cache:
+        return _clip_cache[path]
     try:
-        with open(config.FILLER_AUDIO_PATH, "rb") as f:
-            _filler_audio_cache = f.read()
-        logger.info(
-            "[FILLER] 音声ファイルを読み込みました path=%s bytes=%d",
-            config.FILLER_AUDIO_PATH, len(_filler_audio_cache),
-        )
+        with open(path, "rb") as f:
+            data = f.read()
+        logger.info("[CLIP] 音声ファイルを読み込みました path=%s bytes=%d", path, len(data))
     except OSError as e:
         logger.warning(
-            "[FILLER] 音声ファイルを読み込めませんでした path=%s err=%s（フィラー再生をスキップします）",
-            config.FILLER_AUDIO_PATH, e,
+            "[CLIP] 音声ファイルを読み込めませんでした path=%s err=%s（再生をスキップします）",
+            path, e,
         )
-        _filler_audio_cache = b""
-    return _filler_audio_cache
+        data = b""
+    _clip_cache[path] = data
+    return data
 
 
-if config.ENABLE_FILLER:
-    _load_filler_audio()  # 起動時に一度読み込み、通話中の初回再生での遅延を避ける
+def preload_static_clips() -> None:
+    """起動時に静的音声クリップ（挨拶・縮退運転案内・相槌）を読み込み、
+    通話中の初回再生での遅延を避ける（main.pyのlifespanから呼ぶ）。"""
+    _load_static_clip(config.GREETING_AUDIO_PATH)
+    _load_static_clip(config.DEGRADED_AUDIO_PATH)
+    if config.ENABLE_FILLER:
+        _load_static_clip(config.FILLER_AUDIO_PATH)
+
+
+# 挨拶を「言い終えたもの」として扱わせるための追加ルール。プロンプトDBの
+# 内容に関わらず常に付け足す（改善指示書「挨拶即時再生」2章）。
+GREETING_ALREADY_SAID_NOTICE = (
+    f"\n\n【システム注記】挨拶「{GREETING_TEXT}」は既に音声で再生済みで、"
+    "会話履歴にもあなたの発言として記録されています。この後の最初の応答で"
+    "挨拶を繰り返さないでください。"
+)
+
+
+@dataclass
+class _PendingConnection:
+    """/voice webhook受信時点で開始したOpenAI接続の前倒し（プリウォーム）状態。
+    call_sidをキーに _pending_connections で管理し、Media Streamの`start`
+    受信時にrun()側が回収する（改善指示書「挨拶即時再生」3章）。"""
+    task: asyncio.Task
+    webhook_at: float
+
+
+_pending_connections: dict[str, _PendingConnection] = {}
+_PENDING_CONNECTION_TTL_SEC = 30
 
 
 @dataclass
@@ -105,6 +129,14 @@ class CallSession:
         self.openai: OpenAiRealtimeSocket | None = None
         self._response_id: str | None = None
 
+        # OpenAI接続の前倒し（改善指示書「挨拶即時再生」3章）用の状態。
+        # 接続完了までに届いたユーザー音声はここにキューし、完了後にまとめて
+        # 送る。キュー中に発話終了(END_OF_SPEECH)を検知した場合は
+        # _deferred_end_of_speech を立て、接続完了後のflush直後にcommitする。
+        self._openai_ready = asyncio.Event()
+        self._pending_audio_queue: list[str] = []
+        self._deferred_end_of_speech = False
+
         # 応答音声のフレーム整形・頭切れ対策・診断ログ用の状態（改善指示書2章）。
         # response.created を受けるたびに作り直す（pump_openai_to_twilio参照）。
         self._frame_aligner = twilio_client.FrameAligner()
@@ -138,6 +170,7 @@ async def run(twilio_ws):
         logger.error("[CALL] start フレームを受信できませんでした: %s", e)
         return
 
+    start_received_at = time.monotonic()
     session.stream_sid = start_event.get("streamSid", "")
     start_block = start_event.get("start", {}) or {}
     session.call_sid = start_block.get("callSid", "")
@@ -145,18 +178,20 @@ async def run(twilio_ws):
     session.caller_number = custom_params.get("caller", "")
 
     call_logger.log_event(session.call_sid, session.caller_number, 'to_arrived', 'SUCCESS')
-    twilio_client.start_recording(session.call_sid)
+
+    # 挨拶はOpenAI接続を待たず、事前生成クリップを即座に再生する
+    # （改善指示書「挨拶即時再生」1章）。OpenAI接続自体は /voice webhook
+    # 受信時点で既に裏で開始されている（main.py参照）。
+    await _play_clip_with_mark(session, twilio_ws, config.GREETING_AUDIO_PATH, mark_prefix="greeting")
+    session.greeting_done = True
+    logger.info(
+        "[GREETING] start受信からクリップ送信まで=%.0fms call_sid=%s",
+        (time.monotonic() - start_received_at) * 1000, session.call_sid,
+    )
 
     try:
-        session.openai = await OpenAiRealtimeSocket().connect()
-        instructions = call_logger.get_prompt(call_logger.DEFAULT_INSTRUCTIONS)
-        if config.ENABLE_FILLER:
-            instructions += FILLER_ANTI_DOUBLE_SPEECH_NOTICE
-        await session.openai.send_session_update(instructions)
-        await session.openai.send_greeting()
-        call_logger.log_event(session.call_sid, session.caller_number, 'ws_connected', 'SUCCESS')
-
         async with asyncio.TaskGroup() as tg:
+            tg.create_task(openai_connection_task(session, twilio_ws, start_received_at))
             tg.create_task(pump_twilio_to_openai(session, twilio_ws))
             tg.create_task(pump_openai_to_twilio(session, twilio_ws))
             tg.create_task(watchdogs.silence_watchdog(session))
@@ -209,9 +244,14 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
 
         if event == "media":
             payload_b64 = data["media"]["payload"]
-            # VAD状態に関わらず常時OpenAIへ転送する（発話開始直後の音の
-            # 頭切れを防ぐため。既存main.pyの設計思想を踏襲）
-            await session.openai.append_audio(payload_b64)
+            # VAD状態に関わらず常時転送する（発話開始直後の音の頭切れを
+            # 防ぐため。既存main.pyの設計思想を踏襲）。OpenAI接続がまだ
+            # 準備できていない間（改善指示書「挨拶即時再生」3章）はローカルに
+            # キューし、接続完了後にopenai_connection_taskがまとめて送る。
+            if session._openai_ready.is_set():
+                await session.openai.append_audio(payload_b64)
+            else:
+                session._pending_audio_queue.append(payload_b64)
 
             pcm16 = ulaw_to_pcm16(base64.b64decode(payload_b64))
             for prob, chunk_sec in session.silero.feed(pcm16):
@@ -293,19 +333,32 @@ async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
         _refresh_silence_eligibility(session, reason="speech")
 
     elif event == VadEvent.END_OF_SPEECH:
-        await session.openai.commit()
-        await session.openai.response_create()
-        session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
-        session.response_watchdog_stage = 0
-        if config.ENABLE_FILLER:
-            # モデルの応答音声が生成されるまでの無音区間を埋める即時相槌
-            # （改善指示書1-b）。AWAITING_RESPONSE中はVAD状態機械が確率で
-            # 遷移しない（vad.py参照）ため、この再生はVAD/バージイン判定に
-            # 一切影響しない。
-            await _play_filler(session, twilio_ws)
+        if not session._openai_ready.is_set():
+            # OpenAI接続がまだ準備できていない（改善指示書「挨拶即時再生」
+            # 3章）。接続完了後、openai_connection_taskがキューflush直後に
+            # まとめてcommit+response.createする。
+            session._deferred_end_of_speech = True
+            logger.info("[QUEUE] 発話終了を検知しましたが接続待ちのためcommitを保留します")
+        else:
+            await session.openai.commit()
+            await session.openai.response_create()
+            session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
+            session.response_watchdog_stage = 0
+            if config.ENABLE_FILLER:
+                # モデルの応答音声が生成されるまでの無音区間を埋める即時相槌
+                # （改善指示書1-b）。AWAITING_RESPONSE中はVAD状態機械が確率で
+                # 遷移しない（vad.py参照）ため、この再生はVAD/バージイン判定に
+                # 一切影響しない。
+                await _play_filler(session, twilio_ws)
 
     elif event == VadEvent.BARGE_IN:
-        await session.openai.response_cancel(session._response_id)
+        if session.openai is not None:
+            await session.openai.response_cancel(session._response_id)
+        else:
+            # OpenAI接続確立前（挨拶クリップ再生中等）のバージイン。
+            # キャンセルすべきOpenAI側の応答は存在しないため、Twilio側の
+            # 再生停止のみ行う（改善指示書「挨拶即時再生」3章）。
+            logger.info("[VAD] OpenAI接続確立前のバージインのためresponse.cancelはスキップします")
         await twilio_client.send_clear(twilio_ws, session.stream_sid)
         # cancel/clear を送った時点でAIの発話は止める意思決定が済んでいる。
         # markの往復を待つとその間 ai_is_speaking=True のままローカル状態
@@ -328,8 +381,9 @@ async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
 async def _play_filler(session: CallSession, twilio_ws) -> None:
     """事前録音の短い相槌音声をTwilioへ即座に送る（改善指示書1-b）。
     OpenAIの音声パス（_audio_stats/_frame_aligner）とは完全に独立させる
-    （フィラーは診断対象の「OpenAI→Twilio中継」には含めない）。"""
-    data = _load_filler_audio()
+    （フィラーは診断対象の「OpenAI→Twilio中継」には含めない）。markも
+    送らない（AWAITING_RESPONSE中はVADが確率で遷移しないため不要）。"""
+    data = _load_static_clip(config.FILLER_AUDIO_PATH)
     if not data:
         return
     for i in range(0, len(data), twilio_client.FRAME_BYTES):
@@ -340,7 +394,190 @@ async def _play_filler(session: CallSession, twilio_ws) -> None:
     logger.info("[FILLER] 相槌音声を再生しました bytes=%d", len(data))
 
 
+async def _play_clip_with_mark(session: CallSession, twilio_ws, path: str, mark_prefix: str) -> None:
+    """事前録音クリップ（挨拶・縮退運転案内）を、通常のOpenAI応答と同じ
+    mark/ai_is_speaking管理で再生する（改善指示書「挨拶即時再生」1章）。
+    OpenAIのイベントを経由しないため_audio_stats/_frame_alignerの対象には
+    しない。"""
+    data = _load_static_clip(path)
+    if not data:
+        return
+    session.ai_is_speaking = True
+    await twilio_client.send_lead_silence(twilio_ws, session.stream_sid, config.RESPONSE_LEAD_SILENCE_MS)
+    for i in range(0, len(data), twilio_client.FRAME_BYTES):
+        chunk = data[i:i + twilio_client.FRAME_BYTES]
+        if len(chunk) < twilio_client.FRAME_BYTES:
+            chunk = chunk + twilio_client.SILENCE_BYTE * (twilio_client.FRAME_BYTES - len(chunk))
+        await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, chunk)
+    session._mark_seq += 1
+    mark_name = f"{mark_prefix}_{session._mark_seq}"
+    session._pending_mark_name = mark_name
+    await twilio_client.send_mark(twilio_ws, session.stream_sid, mark_name)
+
+
+def prewarm_openai_connection(call_sid: str) -> None:
+    """/voice webhook受信時点で呼ぶ。OpenAI WebSocket接続・session確立・
+    挨拶の会話履歴注入を、Media Streamの`start`受信を待たずに裏で開始して
+    おく（改善指示書「挨拶即時再生」3章）。録音開始RESTも非ブロッキングで
+    並行実行する（同4章）。
+    """
+    if not call_sid:
+        return
+    if call_sid in _pending_connections:
+        # Twilioがwebhookを再送した場合等の保険。二重に接続を開始すると
+        # 片方が使われないまま残ってしまうため無視する。
+        logger.info("[OA-CONNECT] 既にプリウォーム済みのためスキップします call_sid=%s", call_sid)
+        return
+    webhook_at = time.monotonic()
+    task = asyncio.create_task(_connect_openai_for_call(call_sid))
+    _pending_connections[call_sid] = _PendingConnection(task=task, webhook_at=webhook_at)
+    asyncio.create_task(_cleanup_stale_pending_connection(call_sid))
+    asyncio.create_task(asyncio.to_thread(twilio_client.start_recording, call_sid))
+
+
+async def _cleanup_stale_pending_connection(call_sid: str) -> None:
+    """Media Streamの`start`が届かないまま放置されたプリウォーム接続を掃除
+    する（着信直後に切れた等のレアケース対策）。通常経路ではrun()側の
+    openai_connection_taskが_pending_connectionsから即座に取り出すため、
+    ここには到達しない。"""
+    await asyncio.sleep(_PENDING_CONNECTION_TTL_SEC)
+    pending = _pending_connections.pop(call_sid, None)
+    if pending is None:
+        return
+    logger.warning(
+        "[OA-CONNECT] startイベントが届かないため未使用の接続を破棄します call_sid=%s",
+        call_sid,
+    )
+    pending.task.cancel()
+    try:
+        socket, _ = await pending.task
+        await socket.close()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _wait_for_session_updated(socket: OpenAiRealtimeSocket) -> None:
+    """session.update後、session.updatedイベントが返るまで待つ。GA版APIの
+    確認事項（openai_client.pyのdocstring参照）を踏まえ、session.created/
+    session.updated双方をエコーログに残す。"""
+    async for event in socket.recv_events():
+        event_type = event.get("type")
+        if event_type in ("session.created", "session.updated"):
+            log_session_echo(event)
+        if event_type == "session.updated":
+            return
+        if event_type == "error":
+            raise RuntimeError(f"OpenAI session更新でエラー: {event.get('error')}")
+
+
+async def _connect_openai_for_call(call_sid: str) -> tuple[OpenAiRealtimeSocket, float]:
+    """OpenAI WebSocketへ接続し、session.updateと挨拶の会話履歴注入まで
+    完了させる。戻り値は (接続済みソケット, 準備完了時刻)。"""
+    socket = await OpenAiRealtimeSocket().connect()
+    instructions = call_logger.get_prompt(call_logger.DEFAULT_INSTRUCTIONS) + GREETING_ALREADY_SAID_NOTICE
+    if config.ENABLE_FILLER:
+        instructions += FILLER_ANTI_DOUBLE_SPEECH_NOTICE
+    await socket.send_session_update(instructions)
+    await _wait_for_session_updated(socket)
+    await socket.inject_greeting_said()
+    logger.info("[OA-CONNECT] session確立 call_sid=%s", call_sid)
+    return socket, time.monotonic()
+
+
+async def openai_connection_task(session: CallSession, twilio_ws, start_received_at: float) -> None:
+    """挨拶クリップ再生と並行して走るタスク。プリウォームされたOpenAI接続を
+    回収し、待機中に溜まったユーザー音声をflushする。接続が間に合わなかった/
+    失敗した場合は縮退運転に切り替えてCallEndedを送出する（改善指示書
+    「挨拶即時再生」3章）。"""
+    pending = _pending_connections.pop(session.call_sid, None)
+    try:
+        if pending is not None:
+            socket, ready_at = await asyncio.wait_for(
+                pending.task, timeout=config.OPENAI_CONNECT_TIMEOUT_SEC
+            )
+            logger.info(
+                "[OA-CONNECT] webhook起点=%.0fms start起点=%.0fms (session.updated完了まで) call_sid=%s",
+                (ready_at - pending.webhook_at) * 1000,
+                max(0.0, ready_at - start_received_at) * 1000,
+                session.call_sid,
+            )
+        else:
+            # プリウォームされていない場合のフォールバック（何らかの理由で
+            # /voiceハンドラでの前倒し登録に失敗した場合の保険）。
+            logger.warning(
+                "[OA-CONNECT] プリウォームされた接続が見つかりません。ここで新規接続します call_sid=%s",
+                session.call_sid,
+            )
+            asyncio.create_task(asyncio.to_thread(twilio_client.start_recording, session.call_sid))
+            socket, _ = await asyncio.wait_for(
+                _connect_openai_for_call(session.call_sid), timeout=config.OPENAI_CONNECT_TIMEOUT_SEC
+            )
+    except Exception as e:
+        logger.error(
+            "[OA-CONNECT] 接続に失敗またはタイムアウトしました call_sid=%s err=%s",
+            session.call_sid, e,
+        )
+        call_logger.log_event(
+            session.call_sid, session.caller_number,
+            'ws_connected', 'FAILURE', f'OpenAI接続がタイムアウトまたは失敗しました: {e}',
+        )
+        await _degraded_connection_failure(session, twilio_ws)
+        raise watchdogs.CallEnded("openai_connect_failure")
+
+    session.openai = socket
+    call_logger.log_event(session.call_sid, session.caller_number, 'ws_connected', 'SUCCESS')
+
+    queued = session._pending_audio_queue
+    session._pending_audio_queue = []
+    for payload_b64 in queued:
+        await session.openai.append_audio(payload_b64)
+    logger.info(
+        "[QUEUE] flush frames=%d (%dms分) call_sid=%s",
+        len(queued), len(queued) * 20, session.call_sid,
+    )
+
+    session._openai_ready.set()
+
+    if session._deferred_end_of_speech:
+        session._deferred_end_of_speech = False
+        logger.info("[QUEUE] 保留していた発話終了検知でcommitを送信します call_sid=%s", session.call_sid)
+        await session.openai.commit()
+        await session.openai.response_create()
+        session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
+        session.response_watchdog_stage = 0
+        if config.ENABLE_FILLER:
+            await _play_filler(session, twilio_ws)
+
+
+async def _degraded_connection_failure(session: CallSession, twilio_ws) -> None:
+    """OpenAI接続がタイムアウト/失敗した場合の縮退運転（改善指示書
+    「挨拶即時再生」3章）。案内クリップ再生→切電→要折り返しケース作成。
+    Google Chat通知はlog_eventがFAILUREステータスで自動送信する
+    （openai_connection_task側で既に呼び出し済み）。既存のgoodbye_event
+    による再生完了待ちの仕組み（watchdogs.pyの_say_and_wait_for_goodbyeと
+    同じパターン）を流用する。"""
+    session.transcript_lines.append("(OpenAI接続に失敗したため縮退運転に切り替えました)")
+    session.is_goodbye = True
+    await _play_clip_with_mark(session, twilio_ws, config.DEGRADED_AUDIO_PATH, mark_prefix="goodbye")
+    try:
+        await asyncio.wait_for(session.goodbye_event.wait(), timeout=8.0)
+        await asyncio.sleep(1.0)
+    except asyncio.TimeoutError:
+        logger.warning("[OA-CONNECT] 縮退運転クリップの再生完了を待てませんでした（続行します）")
+    twilio_client.hangup_call(session.call_sid)
+    await asyncio.to_thread(
+        salesforce_case.create_salesforce_case,
+        session.transcript_lines, session.call_sid, session.caller_number,
+        True,
+    )
+    session.case_created = True
+
+
 async def pump_openai_to_twilio(session: CallSession, twilio_ws):
+    # OpenAI接続の前倒し（改善指示書「挨拶即時再生」3章）により、このタスクは
+    # openai_connection_taskが接続を確立するまでsession.openaiがNoneのまま
+    # 起動しうる。準備完了まで待つ。
+    await session._openai_ready.wait()
     async for event in session.openai.recv_events():
         event_type = event.get("type")
 
@@ -362,7 +599,6 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
             session.turn_detector.force_idle()
             session.response_deadline = None
             session.response_watchdog_stage = 0
-            session.greeting_done = True
             # force_idleでVAD状態がIDLEに戻るが、audio_playing(ai_is_speaking)は
             # markの往復でしか False にならない。ここでは適格性を再評価するのみで、
             # まだ再生中なら計測は始まらない（_refresh_silence_eligibility内で判定）。

@@ -64,3 +64,11 @@ RESPONSE_LEAD_SILENCE_MS = _int("RESPONSE_LEAD_SILENCE_MS", 250)
 # 本応答が生成されるまでの無音区間を埋める。
 ENABLE_FILLER = os.getenv("ENABLE_FILLER", "false").strip().lower() == "true"
 FILLER_AUDIO_PATH = os.getenv("FILLER_AUDIO_PATH", "assets/audio/aizuchi_kashikomarimashita.ulaw")
+
+# 挨拶の即時再生（改善指示書「挨拶即時再生」）: 挨拶は事前生成済みクリップを
+# Media Streamの`start`受信直後に再生し、OpenAI接続を待たない。
+GREETING_AUDIO_PATH = os.getenv("GREETING_AUDIO_PATH", "assets/audio/greeting_o_matase.ulaw")
+# OpenAI接続がこの秒数以内に完了しない場合は縮退運転（案内→切電→要折り返し
+# ケース作成）に切り替える。
+OPENAI_CONNECT_TIMEOUT_SEC = _int("OPENAI_CONNECT_TIMEOUT_SEC", 5)
+DEGRADED_AUDIO_PATH = os.getenv("DEGRADED_AUDIO_PATH", "assets/audio/degraded_konzatsu.ulaw")
