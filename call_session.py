@@ -54,6 +54,15 @@ class CallSession:
         self.openai: OpenAiRealtimeSocket | None = None
         self._response_id: str | None = None
 
+        # Twilio markによる「電話口での実際の再生完了」トラッキング用。
+        # response.doneはサーバー側の音声生成完了でしかなく、Realtime APIは
+        # 音声を実時間より速く生成するため、電話口での再生完了は
+        # response.doneより最大5秒以上遅れうる（実測）。そのズレを無音
+        # タイマーに混入させないため、markの往復でしか ai_is_speaking を
+        # Falseにしない。
+        self._pending_mark_name: str | None = None
+        self._mark_seq = 0
+
         self.last_user_speech_time: float | None = None
         self.response_deadline: float | None = None
         self.response_watchdog_stage = 0
@@ -152,6 +161,22 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                     )
                     await _handle_vad_event(session, twilio_ws, transition.event)
 
+        elif event == "mark":
+            mark_name = (data.get("mark") or {}).get("name", "")
+            if mark_name and mark_name == session._pending_mark_name:
+                # 電話口での本当の再生完了。ここが無音タイマーの起点になる
+                # （もう1つの起点はVADのSPEECH_STARTED）。
+                session._pending_mark_name = None
+                session.ai_is_speaking = False
+                session.last_user_speech_time = time.monotonic()
+                logger.info("[MARK] name=%s 応答完了", mark_name)
+                if session.is_goodbye and mark_name.startswith("goodbye_"):
+                    session.goodbye_event.set()
+            else:
+                # バージインでresponse.cancel済みのmarkが遅れて届いた等、
+                # 既に無効化されたmark。二重処理しない。
+                logger.info("[MARK] name=%s (無効化済みのため無視)", mark_name)
+
         elif event == "stop":
             raise watchdogs.CallEnded("twilio_stop")
         # 'connected'（再送されうる）や未知イベントは無視する
@@ -171,10 +196,12 @@ async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
         await session.openai.response_cancel(session._response_id)
         await twilio_client.send_clear(twilio_ws, session.stream_sid)
         # cancel/clear を送った時点でAIの発話は止める意思決定が済んでいる。
-        # output_audio_buffer.cleared/stopped の到着を待つとその間
-        # ai_is_speaking=True のままローカル状態機械が進行を止め続けて
-        # しまうため、ここで即座に折り返す。
+        # markの往復を待つとその間 ai_is_speaking=True のままローカル状態
+        # 機械が進行を止め続けてしまうため、ここで即座に折り返す。
         session.ai_is_speaking = False
+        # 破棄されたキューぶんのmarkがTwilioから遅れて返ってきても
+        # 二重処理しないよう、待機中のmark名を無効化しておく。
+        session._pending_mark_name = None
 
 
 async def pump_openai_to_twilio(session: CallSession, twilio_ws):
@@ -202,17 +229,22 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
         elif event_type == "output_audio_buffer.started":
             session.ai_is_speaking = True
 
-        elif event_type == "output_audio_buffer.stopped":
-            session.ai_is_speaking = False
-            if session.is_goodbye:
-                session.goodbye_event.set()
-            elif session.greeting_done:
-                session.last_user_speech_time = time.monotonic()
-
         elif event_type == "response.output_audio.delta":
             audio_b64 = event.get("delta", "")
             if audio_b64:
                 await twilio_client.send_media(twilio_ws, session.stream_sid, audio_b64)
+
+        elif event_type == "response.output_audio.done":
+            # この応答の音声フレームはすべてTwilioへ送信済み。ただし
+            # Twilioの電話口での再生はまだ完了していない可能性が高い
+            # （Realtime APIは実時間より速く音声を生成するため）。
+            # markを送り、実際の再生完了はTwilioからのmark折り返しで判定する
+            # （pump_twilio_to_openaiのmarkハンドラ側）。
+            session._mark_seq += 1
+            prefix = "goodbye" if session.is_goodbye else "resp"
+            mark_name = f"{prefix}_{session._mark_seq}"
+            session._pending_mark_name = mark_name
+            await twilio_client.send_mark(twilio_ws, session.stream_sid, mark_name)
 
         elif event_type == "response.output_audio_transcript.done":
             text = event.get("transcript", "")

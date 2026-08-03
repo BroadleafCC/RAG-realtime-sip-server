@@ -19,6 +19,7 @@ attach_recording_to_case / create_salesforce_case）をほぼそのまま移植�
 import io
 import json
 import logging
+import re
 import threading
 import time as time_module
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,21 @@ def _sf_connect() -> Salesforce:
         security_token=config.SF_TOKEN,
         domain=config.SF_DOMAIN,
     )
+
+
+def normalize_phone(e164: str) -> str:
+    """E.164形式（+81始まり、Twilioから渡される発信元番号の形式）を
+    国内形式（0始まり）に変換する。例: '+819092415397' -> '09092415397'
+
+    SOSL検索は`+`を不正文字として扱いリクエスト自体が失敗するため、
+    Salesforce検索・ケース保存に渡す前に必ずこれを通す。
+    """
+    if not e164:
+        return e164
+    num = e164.strip()
+    if num.startswith('+81'):
+        num = '0' + num[3:]
+    return re.sub(r'\D', '', num)
 
 
 def search_account_by_phone(sf_instance, phone):
@@ -176,6 +192,10 @@ def create_salesforce_case(transcript_lines: list, call_id: str = "", phone_numb
         subject = "通話ケース"
         contact_person = ""
         destination_phone = phone_number
+
+    # SOSL検索・ケース保存の両方でこの正規化後の値を使う
+    # （+81始まりのE.164形式のままだとSOSLが不正文字としてリクエストごと失敗する）
+    destination_phone = normalize_phone(destination_phone)
 
     try:
         sf = _sf_connect()

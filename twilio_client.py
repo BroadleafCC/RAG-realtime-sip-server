@@ -56,3 +56,16 @@ async def send_clear(ws, stream_sid: str):
         "event": "clear",
         "streamSid": stream_sid,
     }))
+
+
+async def send_mark(ws, stream_sid: str, name: str):
+    """指定した名前のmarkイベントを送る。Twilioは実際にこの位置まで再生し
+    終えた時点で、同じ名前のmarkイベントを送り返してくる。応答の最後の
+    音声フレーム送信直後に呼ぶことで、電話口での再生完了を正確に検知できる
+    （response.doneはサーバー側の生成完了でしかなく、電話口の再生完了より
+    大きく先行するため、これでは代用できない）。"""
+    await ws.send_text(json.dumps({
+        "event": "mark",
+        "streamSid": stream_sid,
+        "mark": {"name": name},
+    }))

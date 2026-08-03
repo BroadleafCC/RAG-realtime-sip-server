@@ -36,8 +36,11 @@ class CallEnded(Exception):
 
 async def _say_and_wait_for_goodbye(session, text: str, wait_timeout: float = 15.0):
     """conversation.item.create + response.create でフレーズを言わせ、
-    output_audio_buffer.stopped（=goodbye_event）を待つ。OpenAI接続が
-    死んでいる場合でも例外を握りつぶして先に進む（hangupは必ず行う）。"""
+    Twilioのmark折り返し（=goodbye_event、call_session.pyのmarkハンドラが
+    セットする）を待つ。response.doneではなくmarkを待つのは、response.done
+    はサーバー側の音声生成完了でしかなく、電話口での実際の再生完了より
+    大きく先行するため（実測で5秒以上）。OpenAI接続が死んでいる場合でも
+    例外を握りつぶして先に進む（hangupは必ず行う）。"""
     session.is_goodbye = True
     try:
         await session.openai.send_text_turn(text)
@@ -46,6 +49,9 @@ async def _say_and_wait_for_goodbye(session, text: str, wait_timeout: float = 15
         return
     try:
         await asyncio.wait_for(session.goodbye_event.wait(), timeout=wait_timeout)
+        # markはTwilioへの送信完了通知であり、電話網を通じて実際に耳に
+        # 届くまでのわずかな遅延を見込んで一呼吸置く。
+        await asyncio.sleep(1.0)
     except asyncio.TimeoutError:
         logger.warning("[WATCHDOG] goodbye再生の完了を待てませんでした（続行します）")
 
