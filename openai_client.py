@@ -64,13 +64,17 @@ GREETING_TEXT = "お待たせしました。ご用件を伺います。"
 def build_greeting_said_item() -> dict:
     """挨拶を会話履歴にassistant発言として注入するconversation.item.create。
     response.createは送らない（次のresponseはユーザー発話のcommit後に発生する）。
+
+    contentタイプはGA版APIでは"output_text"が正しい（"text"を指定すると
+    `invalid_request_error: Invalid value: 'text'. Value must be 'output_text'`
+    でreject される。実機ログで確認済み）。
     """
     return {
         "type": "conversation.item.create",
         "item": {
             "type": "message",
             "role": "assistant",
-            "content": [{"type": "text", "text": GREETING_TEXT}],
+            "content": [{"type": "output_text", "text": GREETING_TEXT}],
         },
     }
 
@@ -137,6 +141,17 @@ class OpenAiRealtimeSocket:
         if response_id:
             payload["response_id"] = response_id
         await self._send(payload)
+
+    async def truncate_item(self, item_id: str, audio_end_ms: int, content_index: int = 0):
+        """バージイン時、モデルの会話履歴を実際に聞こえたところまで切り詰める
+        （改善指示書「バージイン実装」修正1-4）。response.cancel/clearだけでは
+        モデルは「どこまで聞こえたか」を知らないため、これと併用する。"""
+        await self._send({
+            "type": "conversation.item.truncate",
+            "item_id": item_id,
+            "content_index": content_index,
+            "audio_end_ms": audio_end_ms,
+        })
 
     async def recv_events(self):
         async for message in self._ws:

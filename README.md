@@ -26,6 +26,7 @@ python tests/test_vad.py
 python tests/test_audio_convert.py
 python tests/test_twilio_framing.py
 python tests/test_call_session_prewarm.py
+python tests/test_barge_in.py
 ```
 
 ## ローカル起動 + ngrok動作確認
@@ -78,7 +79,37 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
 - `[AUDIO-STATS]` ログ: 応答ごとの音声中継バイト数・再生時間を1行で出力する
   診断ログ。`bytes_in`と`bytes_out`が一致しない場合は自サーバー内での音声欠落、
   `playback_sec`が`expected_sec`から大きく乖離する場合はTwilio側での遅延・欠落を
-  示す。
+  示す。mark名とAudioStatsの対応はmark送信（フレーム送信完了）時点で
+  `CallSession._audio_stats_by_mark` にスナップショットとして確定し、mark受信時に
+  それを引く（`session._audio_stats` を直接見ると、次の応答が既に始まっている
+  場合に別応答のresp_idを記録してしまうため）。
+
+## バージイン（割り込み）
+
+AI発話中にお客様が500ms以上継続して話すと、以下を指示書どおりの順序で行う
+（`call_session._handle_barge_in`）:
+
+1. `response.cancel`（当該応答がまだ生成中＝`response.done`未受信の場合のみ）
+2. Twilioへ`clear`を送り再生キューを破棄
+3. `ai_is_speaking`を即時Falseにし、以後届く当該再生ブロックのmarkを無効化
+4. `conversation.item.truncate`でモデルの会話履歴を実際に聞こえたところ
+   （`audio_end_ms`）まで切り詰める。この値は「音声送信開始からの経過時間」と
+   「実際に送信したバイト数から計算した秒数」の小さい方を採用する近似値。
+   Twilio側の実再生はサーバー送信より遅延するため実際より多めに見積もる
+   ことになるが、切り詰めすぎて既に聞こえた内容を消すより安全側なので
+   この近似でよい
+
+挨拶・縮退運転案内クリップの再生中（`response.output_item.added`を経由しない
+＝item_idを持たない）バージインでは、cancel/truncateは行わずclearのみ行う。
+
+`ai_is_speaking`は`output_audio_buffer.started`イベントに加え、
+`response.output_audio.delta`で実際に音声送信を開始した瞬間にも設定する
+（前者のイベントだけに頼るとバージイン判定が効かないケースが実測されたため
+の二重化）。
+
+ログ: `[BARGE-IN] 発動 speech_ms=XXX 対象=mark名 truncate audio_end_ms=YYY`
+（クリップ再生中は`(クリップ再生のためtruncate不要)`）、500ms未満で終わった
+短い音は`[BARGE-IN] 抑止 speech_ms=XXX (<500ms)`。
 
 ## 受話直後の無音解消・挨拶の即時再生
 
@@ -112,11 +143,13 @@ Media Streamの`start`受信を待たず `/voice` webhook受信時点で前倒�
   `{"type": "audio/pcmu"}` はGA版APIドキュメント調査に基づく仮説。
   `session.updated` イベントのログ（`[SESSION ECHO]`）で実際に通っているか
   確認すること
-- `response.output_audio.delta` というイベント名も同様に未検証（このトランス
-  ポートでの音声中継は既存プロジェクトに前例がなく完全新規実装のため）
+- `response.output_audio.delta` / `response.output_item.added` というイベント名
+  も同様に未検証（このトランスポートでの音声中継は既存プロジェクトに前例が
+  なく完全新規実装のため）。特に`response.output_item.added`が届かない場合、
+  バージイン時のitem_idが取得できず`conversation.item.truncate`が送られない
+  （`[BARGE-IN]`ログで`(クリップ再生のためtruncate不要)`と誤って出る形で
+  判別できる）
 - 挨拶を会話履歴に注入する`conversation.item.create`（role=assistant）の
-  contentタイプを`"text"`と仮定している（`openai_client.build_greeting_said_item`）。
-  GA版の最新ドキュメントで`"output_text"`等に変わっていないか確認すること。
-  誤っている場合はitem作成がエラーになるか無視されるかのいずれかなので、
-  `[OA EVENT] error` ログの有無と、モデルが挨拶を意識できているか
-  （挨拶を繰り返さないか）で判別できる
+  contentタイプは`"output_text"`に修正済み（実機ログで
+  `invalid_request_error: Invalid value: 'text'. Value must be 'output_text'`
+  を確認し対応）。今後API仕様が変わった場合は`[OA EVENT] error`ログで検知できる

@@ -26,7 +26,7 @@ import twilio_client
 import watchdogs
 from audio_convert import ulaw_to_pcm16
 from openai_client import GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
-from vad import TurnDetector, VadEvent, VadState
+from vad import TurnDetector, VadEvent, VadState, VadTransition
 from vad_model import SileroVad
 
 logger = logging.getLogger("call_session")
@@ -129,6 +129,16 @@ class CallSession:
         self.openai: OpenAiRealtimeSocket | None = None
         self._response_id: str | None = None
 
+        # バージイン時のconversation.item.truncateに使う状態（改善指示書
+        # 「バージイン実装」修正1）。_current_item_idは再生中のassistant
+        # メッセージアイテムのid（response.output_item.addedで取得）。
+        # response.createを経由しないクリップ再生（挨拶・縮退運転案内）では
+        # Noneのままとなり、truncateが不要なことを示す。
+        self._current_item_id: str | None = None
+        self._current_response_done = False
+        # [BARGE-IN] 抑止ログ（500ms未満で終わった短い割り込み）の検知用。
+        self._last_barge_in_run_ms = 0.0
+
         # OpenAI接続の前倒し（改善指示書「挨拶即時再生」3章）用の状態。
         # 接続完了までに届いたユーザー音声はここにキューし、完了後にまとめて
         # 送る。キュー中に発話終了(END_OF_SPEECH)を検知した場合は
@@ -142,6 +152,11 @@ class CallSession:
         self._frame_aligner = twilio_client.FrameAligner()
         self._lead_silence_sent = False
         self._audio_stats = _AudioStats()
+        # mark名 -> そのmarkが対応する応答のAudioStats。mark確定（送信）時点で
+        # スナップショットを保持し、mark受信時にそれを引く（改善指示書
+        # 「バージイン実装」修正4）。session._audio_statsは次の応答が始まると
+        # 上書きされてしまうため、これを直接参照するとresp_idを取り違える。
+        self._audio_stats_by_mark: dict[str, _AudioStats] = {}
 
         # Twilio markによる「電話口での実際の再生完了」トラッキング用。
         # response.doneはサーバー側の音声生成完了でしかなく、Realtime APIは
@@ -263,7 +278,15 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                         "[VAD] event=%s state=%s prob=%.3f elapsed_ms=%.0f",
                         transition.event.name, transition.state.name, prob, transition.elapsed_ms,
                     )
-                    await _handle_vad_event(session, twilio_ws, transition.event)
+                    await _handle_vad_event(session, twilio_ws, transition)
+                elif session.ai_is_speaking and session._last_barge_in_run_ms > 0 and transition.elapsed_ms == 0:
+                    # バージイン閾値(500ms)に届かず途切れた短い音（咳・相槌等）。
+                    # デバッグ用に抑止ログを出す（改善指示書「バージイン実装」）。
+                    logger.info(
+                        "[BARGE-IN] 抑止 speech_ms=%.0f (<%dms)",
+                        session._last_barge_in_run_ms, config.BARGE_IN_MIN_MS,
+                    )
+                session._last_barge_in_run_ms = transition.elapsed_ms if session.ai_is_speaking else 0.0
 
         elif event == "mark":
             mark_name = (data.get("mark") or {}).get("name", "")
@@ -291,10 +314,16 @@ def _log_audio_stats(session: CallSession, mark_name: str) -> None:
     """応答1件ぶんの音声中継の診断ログ（改善指示書2-c）。電話口での再生完了
     （mark受信）時に一度だけ出力する。bytes_in != bytes_out は自サーバー内で
     音声が欠落したことを、playback_sec が expected_sec から大きくズレることは
-    Twilio側での欠落・遅延を示す。"""
-    stats = session._audio_stats
-    if stats.deltas == 0:
-        return  # このmarkに対応する応答でOpenAI音声を受信していない（相槌のみ等）
+    Twilio側での欠落・遅延を示す。
+
+    mark名に紐付けて確定時点で保持したスナップショットを引く
+    （session._audio_statsを直接見ると、次の応答が既に始まっている場合に
+    別応答のresp_idを記録してしまうバグがあったため。改善指示書
+    「バージイン実装」修正4）。
+    """
+    stats = session._audio_stats_by_mark.pop(mark_name, None)
+    if stats is None or stats.deltas == 0:
+        return  # このmarkに対応する応答でOpenAI音声を受信していない（相槌等）
     expected_sec = stats.bytes_out / 8000.0
     if stats.first_frame_sent_at is not None:
         playback_sec = f"{time.monotonic() - stats.first_frame_sent_at:.3f}"
@@ -328,7 +357,8 @@ def _refresh_silence_eligibility(session: CallSession, reason: str | None = None
         logger.info("[SILENCE-TIMER] 計測開始")
 
 
-async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
+async def _handle_vad_event(session: CallSession, twilio_ws, transition: VadTransition) -> None:
+    event = transition.event
     if event == VadEvent.SPEECH_STARTED:
         _refresh_silence_eligibility(session, reason="speech")
 
@@ -352,30 +382,64 @@ async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
                 await _play_filler(session, twilio_ws)
 
     elif event == VadEvent.BARGE_IN:
-        if session.openai is not None:
-            await session.openai.response_cancel(session._response_id)
-        else:
-            # OpenAI接続確立前（挨拶クリップ再生中等）のバージイン。
-            # キャンセルすべきOpenAI側の応答は存在しないため、Twilio側の
-            # 再生停止のみ行う（改善指示書「挨拶即時再生」3章）。
-            logger.info("[VAD] OpenAI接続確立前のバージインのためresponse.cancelはスキップします")
-        await twilio_client.send_clear(twilio_ws, session.stream_sid)
-        # cancel/clear を送った時点でAIの発話は止める意思決定が済んでいる。
-        # markの往復を待つとその間 ai_is_speaking=True のままローカル状態
-        # 機械が進行を止め続けてしまうため、ここで即座に折り返す。
-        session.ai_is_speaking = False
-        # 破棄されたキューぶんのmarkがTwilioから遅れて返ってきても
-        # 二重処理しないよう、待機中のmark名を無効化しておく。
-        session._pending_mark_name = None
-        # 中断された応答は正常なmark経路を通らないため、ここで診断ログを
-        # 出しておく（改善指示書2-c）。
+        await _handle_barge_in(session, twilio_ws, transition.elapsed_ms)
+
+
+async def _handle_barge_in(session: CallSession, twilio_ws, speech_ms: float) -> None:
+    """バージイン発動時の処理（改善指示書「バージイン実装」修正1）。指示書
+    どおりの順序で実行する:
+    1) response.cancel（当該応答がまだ生成中の場合のみ）
+    2) Twilioへclearを送り再生キューを破棄
+    3) audio_playingを即時Falseにし、以後のmarkを無効化
+    4) conversation.item.truncateでモデルの履歴を実際に聞こえたところまで
+       切り詰める（response.createを経由した実応答の場合のみ。挨拶/縮退運転
+       クリップの再生中はitem_idが無いため対象外＝clearのみでよい）。
+    """
+    item_id = session._current_item_id
+    mark_name = session._pending_mark_name
+    has_active_response = item_id is not None and session.openai is not None
+
+    if has_active_response and not session._current_response_done:
+        await session.openai.response_cancel(session._response_id)
+
+    await twilio_client.send_clear(twilio_ws, session.stream_sid)
+
+    session.ai_is_speaking = False
+    session._pending_mark_name = None
+    if mark_name is not None:
+        session._audio_stats_by_mark.pop(mark_name, None)
+
+    if has_active_response:
         stats = session._audio_stats
+        elapsed_ms = 0.0
+        if stats.first_frame_sent_at is not None:
+            elapsed_ms = (time.monotonic() - stats.first_frame_sent_at) * 1000
+        expected_ms = stats.bytes_out / 8000.0 * 1000
+        # Twilio側の実再生はサーバー送信より遅延するため、この見積もりは
+        # 実際より数百ms多めになりうる。切り詰めすぎて既に聞こえた内容を
+        # 消してしまうより安全側なので、この近似でよい（改善指示書に同旨）。
+        audio_end_ms = max(0, round(min(elapsed_ms, expected_ms) if expected_ms > 0 else elapsed_ms))
+        await session.openai.truncate_item(item_id, audio_end_ms)
+        logger.info(
+            "[BARGE-IN] 発動 speech_ms=%.0f 対象=%s truncate audio_end_ms=%d",
+            speech_ms, mark_name or "?", audio_end_ms,
+        )
         if stats.deltas:
             logger.info(
                 "[AUDIO-STATS] resp_id=%s barge_in=True deltas=%d bytes_in=%d bytes_out=%d",
                 stats.resp_id, stats.deltas, stats.bytes_in, stats.bytes_out,
             )
-        _refresh_silence_eligibility(session)
+    else:
+        # OpenAI接続確立前、または挨拶/縮退運転クリップの再生中のバージイン。
+        # キャンセル・切り詰めるべきOpenAI側の応答は存在しない
+        # （改善指示書「挨拶即時再生」3章／「バージイン実装」）。
+        logger.info(
+            "[BARGE-IN] 発動 speech_ms=%.0f 対象=%s (クリップ再生のためtruncate不要)",
+            speech_ms, mark_name or "?",
+        )
+
+    session._current_item_id = None
+    _refresh_silence_eligibility(session)
 
 
 async def _play_filler(session: CallSession, twilio_ws) -> None:
@@ -590,15 +654,26 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
                 response_obj.get("id") if isinstance(response_obj, dict) else None
             ) or event.get("response_id") or event.get("id")
             # 応答ごとにフレーム整形バッファ・頭切れ対策フラグ・診断カウンタを
-            # 作り直す（改善指示書2章）。
+            # 作り直す（改善指示書2章）。バージイン用のitem追跡もリセットする
+            # （改善指示書「バージイン実装」修正1）。
             session._frame_aligner = twilio_client.FrameAligner()
             session._lead_silence_sent = False
             session._audio_stats = _AudioStats(resp_id=session._response_id)
+            session._current_item_id = None
+            session._current_response_done = False
+
+        elif event_type == "response.output_item.added":
+            # バージイン時のconversation.item.truncateに必要なitem_idを取得する
+            # （改善指示書「バージイン実装」修正1）。
+            item = event.get("item") or {}
+            if isinstance(item, dict):
+                session._current_item_id = item.get("id")
 
         elif event_type == "response.done":
             session.turn_detector.force_idle()
             session.response_deadline = None
             session.response_watchdog_stage = 0
+            session._current_response_done = True
             # force_idleでVAD状態がIDLEに戻るが、audio_playing(ai_is_speaking)は
             # markの往復でしか False にならない。ここでは適格性を再評価するのみで、
             # まだ再生中なら計測は始まらない（_refresh_silence_eligibility内で判定）。
@@ -622,10 +697,16 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
                 if not session._lead_silence_sent:
                     # この応答で最初の音声が来た瞬間、実フレームの前に無音を
                     # 挟んで頭切れを吸収する（改善指示書2-b）。
+                    # ai_is_speakingもここで確実にTrueにする（改善指示書
+                    # 「バージイン実装」で判明: output_audio_buffer.startedに
+                    # だけ頼るとバージイン判定が効かない実測があったため、
+                    # 実際に音声送信を開始した事実そのものをトリガーにする）。
                     await twilio_client.send_lead_silence(
                         twilio_ws, session.stream_sid, config.RESPONSE_LEAD_SILENCE_MS
                     )
                     session._lead_silence_sent = True
+                    session.ai_is_speaking = True
+                    _refresh_silence_eligibility(session)
 
                 # deltaの境界とTwilioフレーム境界のズレによる欠落を防ぐため、
                 # 20ms(160byte)単位に詰め直してから送信する（改善指示書2-a）。
@@ -657,6 +738,11 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
             prefix = "goodbye" if session.is_goodbye else "resp"
             mark_name = f"{prefix}_{session._mark_seq}"
             session._pending_mark_name = mark_name
+            # mark名とAudioStatsの対応をこの時点（フレーム送信完了時点）で
+            # 確定しておく。session._audio_statsは次の応答が始まると
+            # 上書きされるため、mark受信時に直接参照すると別応答のresp_idを
+            # 誤って記録してしまう（改善指示書「バージイン実装」修正4）。
+            session._audio_stats_by_mark[mark_name] = session._audio_stats
             await twilio_client.send_mark(twilio_ws, session.stream_sid, mark_name)
 
         elif event_type == "response.output_audio_transcript.done":
