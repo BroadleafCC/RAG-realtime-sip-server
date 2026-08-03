@@ -66,14 +66,19 @@ async def silence_watchdog(session):
             continue
         if session.turn_detector.state != VadState.IDLE:
             continue
-        if session.last_user_speech_time is None:
+        if session.silence_anchor is None:
             continue
 
-        elapsed = time.monotonic() - session.last_user_speech_time
+        elapsed = time.monotonic() - session.silence_anchor
         if elapsed < config.SILENCE_TIMEOUT_SEC:
             continue
 
-        logger.info("[SILENCE] %s秒間無言のため通話を切断します", config.SILENCE_TIMEOUT_SEC)
+        logger.info(
+            "[SILENCE] %s秒間無言のため通話を切断します "
+            "(経過=%.1fs audio_playing=%s vad_state=%s)",
+            config.SILENCE_TIMEOUT_SEC, elapsed,
+            session.ai_is_speaking, session.turn_detector.state.name,
+        )
         session.transcript_lines.append("(無言タイムアウトのため通話を切断しました)")
         await _say_and_wait_for_goodbye(session, SILENCE_TIMEOUT_MESSAGE)
         twilio_client.hangup_call(session.call_sid)

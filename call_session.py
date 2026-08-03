@@ -25,7 +25,7 @@ import twilio_client
 import watchdogs
 from audio_convert import ulaw_to_pcm16
 from openai_client import OpenAiRealtimeSocket, log_session_echo
-from vad import TurnDetector, VadEvent
+from vad import TurnDetector, VadEvent, VadState
 from vad_model import SileroVad
 
 logger = logging.getLogger("call_session")
@@ -63,7 +63,11 @@ class CallSession:
         self._pending_mark_name: str | None = None
         self._mark_seq = 0
 
-        self.last_user_speech_time: float | None = None
+        # 無音タイマーの起点。「適格条件（VAD状態==IDLE かつ audio_playing==False）」
+        # が不適格→適格に遷移した瞬間、またはmark受信/SPEECH_STARTED発生時（保険）に
+        # のみ now へリセットされる。_refresh_silence_eligibility() が一元管理する。
+        self.silence_anchor: float | None = None
+        self._silence_eligible = False
         self.response_deadline: float | None = None
         self.response_watchdog_stage = 0
 
@@ -168,7 +172,7 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                 # （もう1つの起点はVADのSPEECH_STARTED）。
                 session._pending_mark_name = None
                 session.ai_is_speaking = False
-                session.last_user_speech_time = time.monotonic()
+                _refresh_silence_eligibility(session, reason="mark")
                 logger.info("[MARK] name=%s 応答完了", mark_name)
                 if session.is_goodbye and mark_name.startswith("goodbye_"):
                     session.goodbye_event.set()
@@ -182,9 +186,29 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
         # 'connected'（再送されうる）や未知イベントは無視する
 
 
+def _refresh_silence_eligibility(session: CallSession, reason: str | None = None) -> None:
+    """無音タイマーの起点(silence_anchor)を一元管理する。
+
+    適格条件 eligible = (turn_detector.state == IDLE) and (ai_is_speaking == False)。
+    reason が指定されたイベント（mark受信/SPEECH_STARTED）では適格性に関わらず
+    無条件にリセットする（保険）。reason が None の場合は不適格→適格への遷移を
+    検出したときにのみリセットする（これが無音タイマー本来の起点）。
+    """
+    eligible = (not session.ai_is_speaking) and (session.turn_detector.state == VadState.IDLE)
+    became_eligible = eligible and not session._silence_eligible
+    session._silence_eligible = eligible
+
+    if reason is not None:
+        session.silence_anchor = time.monotonic()
+        logger.info("[SILENCE-TIMER] リセット (要因: %s)", reason)
+    elif became_eligible:
+        session.silence_anchor = time.monotonic()
+        logger.info("[SILENCE-TIMER] 計測開始")
+
+
 async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
     if event == VadEvent.SPEECH_STARTED:
-        session.last_user_speech_time = time.monotonic()
+        _refresh_silence_eligibility(session, reason="speech")
 
     elif event == VadEvent.END_OF_SPEECH:
         await session.openai.commit()
@@ -202,6 +226,7 @@ async def _handle_vad_event(session: CallSession, twilio_ws, event: VadEvent):
         # 破棄されたキューぶんのmarkがTwilioから遅れて返ってきても
         # 二重処理しないよう、待機中のmark名を無効化しておく。
         session._pending_mark_name = None
+        _refresh_silence_eligibility(session)
 
 
 async def pump_openai_to_twilio(session: CallSession, twilio_ws):
@@ -221,13 +246,16 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
             session.turn_detector.force_idle()
             session.response_deadline = None
             session.response_watchdog_stage = 0
-            if not session.greeting_done:
-                session.greeting_done = True
-                session.last_user_speech_time = time.monotonic()
+            session.greeting_done = True
+            # force_idleでVAD状態がIDLEに戻るが、audio_playing(ai_is_speaking)は
+            # markの往復でしか False にならない。ここでは適格性を再評価するのみで、
+            # まだ再生中なら計測は始まらない（_refresh_silence_eligibility内で判定）。
+            _refresh_silence_eligibility(session)
             _log_response_usage(session, event)
 
         elif event_type == "output_audio_buffer.started":
             session.ai_is_speaking = True
+            _refresh_silence_eligibility(session)
 
         elif event_type == "response.output_audio.delta":
             audio_b64 = event.get("delta", "")
