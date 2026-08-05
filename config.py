@@ -50,6 +50,18 @@ VAD_SPEECH_END_MS = _int("VAD_SPEECH_END_MS", 500)
 BARGE_IN_MIN_MS = _int("BARGE_IN_MIN_MS", 500)
 GRACE_AFTER_AI_END_MS = _int("GRACE_AFTER_AI_END_MS", 500)
 
+# Silero推論をイベントループから追い出す（2026-08-05障害の根本治療）。
+# 同期onnx推論をイベントループ上で直接回すと、推論が詰まった際にループ全体
+# （音声中継・無音タイマー・全ウォッチドッグ）が同時に凍結し、発話終了検知も
+# 切電も止まる。根本修正のため既定でON。
+VAD_INFERENCE_IN_THREAD = os.getenv("VAD_INFERENCE_IN_THREAD", "true").strip().lower() == "true"
+# VAD推論専用スレッドプールのワーカー数。録音開始リトライ等の長時間タスクと
+# 混ざらないよう分離するため、想定同時通話数程度を設定する。
+VAD_EXECUTOR_MAX_WORKERS = _int("VAD_EXECUTOR_MAX_WORKERS", 4)
+# VAD入力バッファの上限（秒）。入力が消費に追いつかない状況で溜め込み続けると
+# 推論が実時間から遅れて発話終了判定が遅延するため、超過分は古い側から捨てる。
+VAD_MAX_BUFFER_SEC = _float("VAD_MAX_BUFFER_SEC", 1.0)
+
 SILENCE_TIMEOUT_SEC = _int("SILENCE_TIMEOUT_SEC", 10)
 MAX_CALL_DURATION_SEC = _int("MAX_CALL_DURATION_SEC", 300)
 RESPONSE_WATCHDOG_FIRST_SEC = _int("RESPONSE_WATCHDOG_FIRST_SEC", 5)
@@ -77,6 +89,13 @@ DISCONNECT_TRACKING_ENABLED = os.getenv("DISCONNECT_TRACKING_ENABLED", "false").
 RECORDING_RETRY_ENABLED = os.getenv("RECORDING_RETRY_ENABLED", "true").strip().lower() == "true"
 RECORDING_MAX_RETRIES = _int("RECORDING_MAX_RETRIES", 4)
 RECORDING_RETRY_BACKOFF_MS = _int("RECORDING_RETRY_BACKOFF_MS", 300)
+
+# イベントループのブロック監視（最終安全網）。ループ外の別スレッドから
+# ハートビートの鮮度を見張り、停止していればプロセスを落として再起動させる。
+# 閾値は「正常な処理では絶対に到達しない値」であることが重要（誤発火すると
+# 進行中の他通話を巻き添えにする）。15秒より短くしないこと。
+LOOP_HEARTBEAT_ENABLED = os.getenv("LOOP_HEARTBEAT_ENABLED", "true").strip().lower() == "true"
+LOOP_HEARTBEAT_STALL_SEC = _float("LOOP_HEARTBEAT_STALL_SEC", 15.0)
 
 # 挨拶の即時再生（改善指示書「挨拶即時再生」）: 挨拶は事前生成済みクリップを
 # Media Streamの`start`受信直後に再生し、OpenAI接続を待たない。

@@ -15,6 +15,7 @@ import base64
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from starlette.websockets import WebSocketDisconnect
@@ -38,6 +39,14 @@ FILLER_ANTI_DOUBLE_SPEECH_NOTICE = (
     "\n\n【システム注記】ユーザーの発話終了直後に短い相槌（「かしこまりました」）が"
     "自動再生されています。あなたの応答をこの相槌の繰り返しから始めないでください。"
     "相槌は言い終えたものとして扱い、続きの内容から話し始めてください。"
+)
+
+# VAD推論専用のスレッドプール（2026-08-05障害の根本治療）。
+# asyncio.to_thread の既定プールは録音開始リトライ（最大約2.4秒スリープ）等の
+# 長時間タスクと共有されるため、そこにVAD推論を載せると録音リトライの巻き添えで
+# 推論が待たされる。短時間・高頻度のVAD推論は専用プールに分離する。
+_vad_executor = ThreadPoolExecutor(
+    max_workers=config.VAD_EXECUTOR_MAX_WORKERS, thread_name_prefix="vad",
 )
 
 _clip_cache: dict[str, bytes] = {}
@@ -125,7 +134,10 @@ class CallSession:
             speech_end_ms=config.VAD_SPEECH_END_MS,
             barge_in_min_ms=config.BARGE_IN_MIN_MS,
         )
-        self.silero = SileroVad()
+        self.silero = SileroVad(max_buffer_sec=config.VAD_MAX_BUFFER_SEC)
+        # [VAD-DROP] ログの間引き用（毎フレーム出すとログ洪水になる）。
+        self._vad_drop_logged_total = 0
+        self._vad_drop_logged_at = 0.0
         self.openai: OpenAiRealtimeSocket | None = None
         self._response_id: str | None = None
 
@@ -474,6 +486,51 @@ async def _wait_for_start(twilio_ws) -> dict:
             logger.warning("[CALL] start前に想定外のイベント: %s", data.get("event"))
 
 
+async def _vad_feed(session: CallSession, pcm16: bytes) -> list[tuple[float, float]]:
+    """Silero VADへ音声を渡し、推論結果を返す（2026-08-05障害の根本治療）。
+
+    `SileroVad.feed` は同期のonnx推論を含む。これをイベントループ上で直接
+    回すと、推論が詰まった際にループ全体がブロックされ、音声中継も無音タイマーも
+    3つのウォッチドッグもまとめて凍結する（＝発話終了が検知されず、切電もされない）。
+    実際にそれが起きたため、推論は専用スレッドプールへ逃がす。
+
+    【厳守】`SileroVad` はスレッドセーフではない。ここは単一の
+    `pump_twilio_to_openai` ループから逐次 `await` されることで、同一通話内の
+    `feed` が同時に複数実行されないことが保証されている。次のフレームは前の
+    `feed` が返るまで処理されない。この逐次性を壊す変更（feedの並行発火）は厳禁。
+    """
+    if not config.VAD_INFERENCE_IN_THREAD:
+        return session.silero.feed(pcm16)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_vad_executor, session.silero.feed, pcm16)
+
+
+_VAD_DROP_LOG_INTERVAL_SEC = 5.0
+
+
+def _maybe_log_vad_drop(session: CallSession) -> None:
+    """VADバッファの破棄が発生していることを間引いてログする。
+
+    通常の通話ではこのログは出ない。常態的に出るなら「入力が消費に追いついて
+    いない」＝推論がイベントループから追い出せていない／CPUが足りていない兆候
+    なので、再調査の入口になる。
+    """
+    dropped_total = session.silero.dropped_samples_total
+    if dropped_total <= session._vad_drop_logged_total:
+        return
+    now = time.monotonic()
+    if now - session._vad_drop_logged_at < _VAD_DROP_LOG_INTERVAL_SEC:
+        return
+    logger.warning(
+        "[VAD-DROP] VADバッファ上限(%.1fs)超過により音声を破棄しています "
+        "dropped_total=%dサンプル(%.2fs相当) call_sid=%s",
+        config.VAD_MAX_BUFFER_SEC, dropped_total, dropped_total / 8000.0,
+        session.call_sid,
+    )
+    session._vad_drop_logged_total = dropped_total
+    session._vad_drop_logged_at = now
+
+
 async def pump_twilio_to_openai(session: CallSession, twilio_ws):
     while True:
         try:
@@ -496,7 +553,10 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                 session._pending_audio_queue.append(payload_b64)
 
             pcm16 = ulaw_to_pcm16(base64.b64decode(payload_b64))
-            for prob, chunk_sec in session.silero.feed(pcm16):
+            vad_results = await _vad_feed(session, pcm16)
+            _maybe_log_vad_drop(session)
+
+            for prob, chunk_sec in vad_results:
                 transition = session.turn_detector.update(
                     prob, chunk_sec * 1000, session.ai_is_speaking
                 )

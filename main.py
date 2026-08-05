@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ from starlette.websockets import WebSocketDisconnect
 import call_logger
 import call_session
 import config
+import loop_heartbeat
 
 # Windows上のローカル開発では既定のstdout/stderrエンコーディングがUTF-8で
 # ないことがあり、日本語ログ（通話記録・エラーメッセージ）が文字化けする。
@@ -28,7 +30,21 @@ async def lifespan(app: FastAPI):
     call_logger.init_db()
     call_logger.cleanup_old_logs()
     call_session.preload_static_clips()
+
+    # イベントループのブロック監視（最終安全網）。ループ上のウォッチドッグは
+    # ループが固まれば一緒に死ぬため、監視だけはループ外の別スレッドに置く。
+    heartbeat_task = None
+    if config.LOOP_HEARTBEAT_ENABLED:
+        loop_heartbeat.start_monitor(config.LOOP_HEARTBEAT_STALL_SEC)
+        heartbeat_task = asyncio.create_task(loop_heartbeat.heartbeat_loop())
+
     yield
+
+    # シャットダウン時はハートビートを止める。止めないと、終了処理中に
+    # ビートが途絶えたことをブロックと誤認してしまう。
+    if heartbeat_task is not None:
+        loop_heartbeat.stop()
+        heartbeat_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)

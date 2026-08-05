@@ -39,9 +39,15 @@ def _post_voice(client):
     return client.post("/voice", data={"From": "+819012345678", "CallSid": "CA_twiml"})
 
 
+def _no_heartbeat():
+    """テスト中はループ監視を起動しない。監視は stall 検知時に os._exit する
+    仕組みなので、テストプロセスに常駐させない（誤発火でpytestごと落ちる）。"""
+    return _Patch(config, "LOOP_HEARTBEAT_ENABLED", False)
+
+
 def test_twiml_unchanged_when_tracking_disabled():
     """OFFのときのTwiMLは従来どおり（statusCallbackを一切足さない）。"""
-    with _Patch(config, "DISCONNECT_TRACKING_ENABLED", False), \
+    with _no_heartbeat(), _Patch(config, "DISCONNECT_TRACKING_ENABLED", False), \
          _Patch(call_session, "prewarm_openai_connection", lambda call_sid: None):
         with TestClient(main.app) as client:
             resp = _post_voice(client)
@@ -52,7 +58,7 @@ def test_twiml_unchanged_when_tracking_disabled():
 
 
 def test_twiml_adds_status_callback_when_tracking_enabled():
-    with _Patch(config, "DISCONNECT_TRACKING_ENABLED", True), \
+    with _no_heartbeat(), _Patch(config, "DISCONNECT_TRACKING_ENABLED", True), \
          _Patch(call_session, "prewarm_openai_connection", lambda call_sid: None):
         with TestClient(main.app) as client:
             resp = _post_voice(client)
@@ -65,7 +71,7 @@ def test_twiml_adds_status_callback_when_tracking_enabled():
 
 def test_call_status_returns_204_and_records_nothing_when_disabled():
     recorded = []
-    with _Patch(config, "DISCONNECT_TRACKING_ENABLED", False), \
+    with _no_heartbeat(), _Patch(config, "DISCONNECT_TRACKING_ENABLED", False), \
          _Patch(call_session, "record_call_status", lambda sid, payload: recorded.append(sid)):
         with TestClient(main.app) as client:
             resp = client.post("/call-status", data={"CallSid": "CA_x", "CallDuration": "0"})
@@ -76,7 +82,7 @@ def test_call_status_returns_204_and_records_nothing_when_disabled():
 def test_call_status_records_twilio_fields_when_enabled():
     """Twilioのフィールド名は確定値。憶測の別名を使わないこと。"""
     recorded = []
-    with _Patch(config, "DISCONNECT_TRACKING_ENABLED", True), \
+    with _no_heartbeat(), _Patch(config, "DISCONNECT_TRACKING_ENABLED", True), \
          _Patch(call_session, "record_call_status", lambda sid, payload: recorded.append((sid, payload))):
         with TestClient(main.app) as client:
             resp = client.post("/call-status", data={

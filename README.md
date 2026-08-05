@@ -63,6 +63,7 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
 | `call_logger.py` | ログDB・Google Chat通知・コスト集計（既存プロジェクトから移植） |
 | `salesforce_case.py` | Salesforceケース作成・録音/Whisperパイプライン（既存から移植） |
 | `watchdogs.py` | 無音／最大通話時間／応答ウォッチドッグの3独立監視ループ |
+| `loop_heartbeat.py` | イベントループのブロックをループ外（別スレッド）から検知する最終安全網 |
 | `assets/audio/` | 挨拶・即時相槌・縮退運転案内の事前生成済み音声アセット |
 | `scripts/generate_static_clips.py` | 上記音声アセットの生成/再生成スクリプト（OpenAI TTS使用） |
 
@@ -136,6 +137,44 @@ Media Streamの`start`受信を待たず `/voice` webhook受信時点で前倒�
 - ログ: `[GREETING] start受信からクリップ送信まで=XXms`、
   `[OA-CONNECT] webhook起点=XXms start起点=XXms (session.updated完了まで)`、
   `[QUEUE] flush frames=N (XXms分)` で各段階の所要時間を追える
+
+## VAD推論とイベントループ（2026-08-05障害の恒久対策）
+
+**症状**：挨拶再生後に話しかけてもAIが無反応になり、無音が続いても切電されない。
+ログは `[VAD] event=SPEECH_STARTED` で完全に途切れ、`finally` の `[DISCONNECT]`
+すら出ない（＝例外ではなくブロック）。録音には26秒分の音声が残っていた。
+
+**原因**：`SileroVad.feed()` の同期onnx推論をイベントループ上で直接実行していた。
+`feed()` はバッファ蓄積型のため、入力ペースが消費ペースを上回ると1回のfeedで
+推論を連続実行 → ループを長くブロック → その間さらに音声が溜まる、という悪循環に
+入り、ループが復帰しなくなる。ループが止まれば `vad.TurnDetector.update()` も
+3つのウォッチドッグも同時に凍る（＝発話終了検知も切電も止まる）。
+
+対策は3本柱：
+
+1. **推論を専用スレッドプールへ退避**（`VAD_INFERENCE_IN_THREAD`、既定ON）。
+   `call_session._vad_feed` が `run_in_executor(_vad_executor, ...)` で実行する。
+   `asyncio.to_thread` の既定プールを使わないのは、録音開始リトライ
+   （最大約2.4秒スリープ）と同居させると巻き添えで推論が待たされるため。
+   **`SileroVad` はスレッドセーフではない**ので、`pump_twilio_to_openai` の単一
+   whileループから逐次 `await` する形（＝同一通話で `feed` が重ならない）を
+   必ず維持すること。
+2. **VADバッファの上限**（`VAD_MAX_BUFFER_SEC`、既定1.0秒）。超過分は古い側から
+   捨てる。リアルタイム音声では遅れた古い音声を処理し続けるより最新に追いつく
+   ほうが正しい。破棄が起きると `[VAD-DROP]` を5秒に1回まで間引いて出す。
+   **通常の通話では出ない**。常態的に出るなら①が効いていない兆候。
+3. **ループ・ハートビート監視**（`LOOP_HEARTBEAT_ENABLED`、既定ON）。
+   ループ上のウォッチドッグはループが固まれば一緒に死ぬため、監視だけを
+   daemonスレッドに置く。ハートビートが `LOOP_HEARTBEAT_STALL_SEC`（既定15秒）
+   途絶えたら全スレッドのスタックを吐いて `os._exit(1)` し、Railwayに再起動
+   させる。ループが固まった時点でそのプロセス上の全通話が既に無反応なので、
+   再起動が唯一の復帰手段。**閾値を15秒より短くしないこと**（誤発火は進行中の
+   他通話を巻き添えにする）。起動前・シャットダウン後は監視を無効化してあり、
+   その状態では絶対に発火しない。
+
+**今後の原則**：ローカル推論などの同期CPU処理を `async` 関数内で直接呼ばない。
+必ず `run_in_executor` / `to_thread` に逃がす（録音RESTでは既にこのパターンを
+使っていたのに、VAD推論に適用が漏れていた）。
 
 ## 切断主体の推定記録（`DISCONNECT_TRACKING_ENABLED`）
 
