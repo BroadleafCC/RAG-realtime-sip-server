@@ -133,7 +133,7 @@ def test_connection_failure_triggers_degraded_flow():
 
     sf_calls = []
 
-    def fake_create_case(transcript_lines, call_id, phone_number, escalation):
+    def fake_create_case(transcript_lines, call_id, phone_number, escalation, recording_sid=""):
         sf_calls.append((call_id, phone_number, escalation))
         return "case123"
 

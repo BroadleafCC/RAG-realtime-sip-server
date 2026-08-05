@@ -65,6 +65,19 @@ RESPONSE_LEAD_SILENCE_MS = _int("RESPONSE_LEAD_SILENCE_MS", 250)
 ENABLE_FILLER = os.getenv("ENABLE_FILLER", "false").strip().lower() == "true"
 FILLER_AUDIO_PATH = os.getenv("FILLER_AUDIO_PATH", "assets/audio/aizuchi_kashikomarimashita.ulaw")
 
+# 切断主体の推定記録（修正指示書パートA）。trueのときのみ /call-status を受け付け、
+# 通話終了時に [DISCONNECT] 分類ログを1行出す。分類はサーバー内部状態
+# （OA接続到達・VAD発話有無・mark進捗）が主で、Twilioのコールバックは補助情報。
+# Twilioは「どちらが切ったか」を返さないため、あくまで推定である点に注意。
+DISCONNECT_TRACKING_ENABLED = os.getenv("DISCONNECT_TRACKING_ENABLED", "false").strip().lower() == "true"
+
+# 録音開始のリトライ（修正指示書パートB）。通話がin-progressへ完全に遷移する前に
+# recordings.create()を叩くとTwilioは21220（Requested resource is not eligible
+# for recording）で拒否する。安全側の修正のためデフォルトで有効。
+RECORDING_RETRY_ENABLED = os.getenv("RECORDING_RETRY_ENABLED", "true").strip().lower() == "true"
+RECORDING_MAX_RETRIES = _int("RECORDING_MAX_RETRIES", 4)
+RECORDING_RETRY_BACKOFF_MS = _int("RECORDING_RETRY_BACKOFF_MS", 300)
+
 # 挨拶の即時再生（改善指示書「挨拶即時再生」）: 挨拶は事前生成済みクリップを
 # Media Streamの`start`受信直後に再生し、OpenAI接続を待たない。
 GREETING_AUDIO_PATH = os.getenv("GREETING_AUDIO_PATH", "assets/audio/greeting_o_matase.ulaw")

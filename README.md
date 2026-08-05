@@ -52,7 +52,7 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
 
 | ファイル | 役割 |
 |---|---|
-| `main.py` | FastAPIアプリ本体（`/voice`, `/media-stream`, `/recording/{sid}`, `/health`） |
+| `main.py` | FastAPIアプリ本体（`/voice`, `/media-stream`, `/call-status`, `/recording/{sid}`, `/health`） |
 | `config.py` | 環境変数・チューニング値の一元管理 |
 | `call_session.py` | 1通話ぶんのオーケストレーター（5タスク並行実行） |
 | `vad.py` | 発話区切り判定の状態機械（純粋・同期・単体テスト可） |
@@ -136,6 +136,52 @@ Media Streamの`start`受信を待たず `/voice` webhook受信時点で前倒�
 - ログ: `[GREETING] start受信からクリップ送信まで=XXms`、
   `[OA-CONNECT] webhook起点=XXms start起点=XXms (session.updated完了まで)`、
   `[QUEUE] flush frames=N (XXms分)` で各段階の所要時間を追える
+
+## 切断主体の推定記録（`DISCONNECT_TRACKING_ENABLED`）
+
+「つながった瞬間に切れた」通話が、サーバーのバグなのか発信側の都合なのかを
+毎回ログと録音の突き合わせで手作業判定していたため、通話終了時に1行で
+分類ログを出す（既定OFF。検証時のみ `DISCONNECT_TRACKING_ENABLED=true`）。
+
+**Twilioは「発信側が切ったか着信側が切ったか」を返さない。** ここで行うのは
+観測可能な事実の合成による『推定』であり、断定ではない。判定材料は
+サーバー内部状態が主で、Twilioのステータスコールバック（`/call-status`）は
+Durationの裏取り用の補助情報でしかない（届かなくても分類は成立し、
+`duration=?` になるだけ）。分類ログの出力位置は「通話後処理へ入る直前」に
+固定してあり、コールバックの到着は待たない。
+
+| カテゴリ | 意味 |
+|---|---|
+| `SERVER_INITIATED_HANGUP` | 無音/最大通話時間/応答ウォッチドッグ/接続失敗でサーバー側から切った |
+| `PRE_CONNECT_HANGUP` | `[OA-CONNECT] session確立` 到達前に終了（接続前切れ・要録音確認） |
+| `HANGUP_DURING_GREETING` | OA接続後・挨拶クリップの再生完了mark前に終了 |
+| `HANGUP_NO_SPEECH` | 挨拶は流れたがVADの発話検知ゼロで終了（無言切り） |
+| `SHORT_CALL_AFTER_SPEECH` | 発話ありだがDurationが5秒未満（途中切れの可能性） |
+| `NORMAL_COMPLETION` | 会話成立後の終了 |
+
+再生の進捗判定には**markのみ**を使う（`response.done`はサーバー側の生成完了
+でしかなく、電話口での再生完了より大きく先行するため根拠にならない）。
+分岐は早期returnのみで書く（elifチェーンで安全装置が死んだ前科があるため）。
+
+ログ例:
+`[DISCONNECT] call_sid=CAxxx category=PRE_CONNECT_HANGUP duration=0s end_reason=twilio_stop oa_established=False any_speech=False greeting_done=False last_mark=- response_count=0 sip=- :: 推定 ...`
+
+## 録音の取得（Call SID 直引き・録音開始のリトライ）
+
+- **録音開始（`RECORDING_RETRY_ENABLED`、既定true）**: 通話が in-progress へ
+  完全に遷移する前に `recordings.create()` を叩くとTwilioは21220
+  （Requested resource is not eligible for recording）で拒否する。
+  `twilio_client.start_recording` は21220に対して 300/600/900ms のバックオフで
+  最大4回リトライし、成功したRecording SIDを返す。待機に`time.sleep`を使うため
+  **必ず `asyncio.to_thread` 経由で呼ぶこと**（イベントループを塞がない）。
+- **録音の特定は Call SID 紐付けに固定**: 「`start_recording`が返したSID」→
+  「`calls(call_sid).recordings`」の順で引く。時間窓（`DateCreated>`）＋直近N件で
+  探す実装は、録音開始に失敗した通話が**直前の別通話の録音を掴む**
+  （＝他人の通話内容がケースに入る）事故を起こしたため撤去済み。
+  **時間窓で録音を探す実装を今後書かないこと。**
+- **録音が無い通話**: 他通話の録音で埋めず、`[POSTCALL] 録音無し` を出して
+  ケースの対応備考に「録音取得失敗のため通話内容なし」と明記する。
+  ケース自体は従来どおり作成する（案件を落とさない設計思想は維持）。
 
 ## 既知の未検証事項（実機での初回テストで確認すること）
 

@@ -134,6 +134,7 @@ async def response_watchdog(session):
             session.call_sid,
             session.caller_number,
             True,
+            session.recording_sid,
         )
         session.case_created = True
         call_logger.log_event(
