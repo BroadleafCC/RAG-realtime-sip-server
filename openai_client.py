@@ -13,7 +13,6 @@ Stage 1のngrokスモークテストで session.updated イベントの
 session.audio.input.format エコーバックを必ずログで確認すること
 （本ファイルの _log_session_echo がそれを行う）。
 """
-import asyncio
 import json
 import logging
 
@@ -22,11 +21,6 @@ import websockets
 import config
 
 logger = logging.getLogger("openai_client")
-
-
-class OpenAiSendTimeout(Exception):
-    """OpenAIソケットへの送信がタイムアウトした（バックプレッシャー等で
-    相手が読んでいない疑い）。呼び出し側はOpenAI故障として縮退運転に入ること。"""
 
 REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model={model}"
 
@@ -108,10 +102,6 @@ class OpenAiRealtimeSocket:
 
     async def connect(self):
         url = REALTIME_WS_URL.format(model=self.model)
-        # ping_interval/ping_timeout はkeepalive（半死接続の自動検知）。
-        # 送信側は _send のタイムアウトが先に効くが、受信側（recv_events）が
-        # 無言のまま固まるケースはこのkeepaliveが例外化して救う。無効化
-        # （ping_interval=None）にしないこと。
         self._ws = await websockets.connect(
             url,
             additional_headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
@@ -125,30 +115,7 @@ class OpenAiRealtimeSocket:
             await self._ws.close()
 
     async def _send(self, payload: dict):
-        """全送信の共通経路。ハング（相手が読まない）を速い失敗に変換する。
-
-        2026-08-05障害：OpenAIサーバーが音声を消費しなくなると、WebSocket送信は
-        フロー制御（TCPバックプレッシャー）で永久ブロックする。例外は出ないため
-        try/exceptでは捕らえられず、awaitしたタスクごとハングする。タイムアウトで
-        例外化することで、既存の例外ハンドリング（縮退運転・ウォッチドッグの
-        try/except）がそのまま機能するようになる。
-
-        送信メソッドは append_audio / commit / response_create / send_text_turn /
-        response_cancel / truncate_item / inject_greeting_said /
-        send_session_update と散らばっているため、個別に wait_for を書くのではなく
-        ここ1箇所で一括して適用する（個別対応は必ず漏れる。実際に
-        _say_and_wait_for_goodbye の送信が漏れて安全網ごとハングした）。
-        """
-        try:
-            await asyncio.wait_for(
-                self._ws.send(json.dumps(payload)),
-                timeout=config.OPENAI_SEND_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            raise OpenAiSendTimeout(
-                f"OpenAI送信が{config.OPENAI_SEND_TIMEOUT_SEC}秒以内に完了しませんでした"
-                f"（サーバーが読んでいない疑い） type={payload.get('type')}"
-            ) from None
+        await self._ws.send(json.dumps(payload))
 
     async def send_session_update(self, instructions: str):
         await self._send(build_session_update(instructions))

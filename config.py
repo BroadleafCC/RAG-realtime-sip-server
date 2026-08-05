@@ -50,33 +50,6 @@ VAD_SPEECH_END_MS = _int("VAD_SPEECH_END_MS", 500)
 BARGE_IN_MIN_MS = _int("BARGE_IN_MIN_MS", 500)
 GRACE_AFTER_AI_END_MS = _int("GRACE_AFTER_AI_END_MS", 500)
 
-# Silero推論をイベントループから追い出す（2026-08-05障害の根本治療）。
-# 同期onnx推論をイベントループ上で直接回すと、推論が詰まった際にループ全体
-# （音声中継・無音タイマー・全ウォッチドッグ）が同時に凍結し、発話終了検知も
-# 切電も止まる。根本修正のため既定でON。
-VAD_INFERENCE_IN_THREAD = os.getenv("VAD_INFERENCE_IN_THREAD", "true").strip().lower() == "true"
-# VAD推論専用スレッドプールのワーカー数。録音開始リトライ等の長時間タスクと
-# 混ざらないよう分離するため、想定同時通話数程度を設定する。
-VAD_EXECUTOR_MAX_WORKERS = _int("VAD_EXECUTOR_MAX_WORKERS", 4)
-# VAD入力バッファの上限（秒）。入力が消費に追いつかない状況で溜め込み続けると
-# 推論が実時間から遅れて発話終了判定が遅延するため、超過分は古い側から捨てる。
-VAD_MAX_BUFFER_SEC = _float("VAD_MAX_BUFFER_SEC", 1.0)
-
-# --- awaitハング対策のタイムアウト群（2026-08-05 pump停止障害） ---------------
-# 外部I/Oのawaitは例外を出さずに永久ブロックしうる（WebSocket送信のフロー制御
-# など）。try/exceptはハングを捕らえられないため、タイムアウトで例外に変換する。
-#
-# OpenAI送信: 正常時はµ秒〜ms級。3秒詰まる時点で会話は既に破綻している。
-OPENAI_SEND_TIMEOUT_SEC = _float("OPENAI_SEND_TIMEOUT_SEC", 3.0)
-# Twilio受信: mediaフレームは20ms間隔で常時届く。通話中の10秒無受信はあり得ない。
-TWILIO_RECV_TIMEOUT_SEC = _float("TWILIO_RECV_TIMEOUT_SEC", 10.0)
-# VAD推論: 正常時は数ms。ワーカースレッド内で返らなくなった場合の脱出。
-VAD_FEED_TIMEOUT_SEC = _float("VAD_FEED_TIMEOUT_SEC", 2.0)
-# pump進捗監視: 「フレーム処理が進まない」という事実だけを見る最終安全網。
-# VAD状態にも応答期限にも依存しないため、状態固着でも必ず発火する。
-PUMP_STALL_SEC = _float("PUMP_STALL_SEC", 10.0)
-PUMP_STALL_WATCHDOG_ENABLED = os.getenv("PUMP_STALL_WATCHDOG_ENABLED", "true").strip().lower() == "true"
-
 SILENCE_TIMEOUT_SEC = _int("SILENCE_TIMEOUT_SEC", 10)
 MAX_CALL_DURATION_SEC = _int("MAX_CALL_DURATION_SEC", 300)
 RESPONSE_WATCHDOG_FIRST_SEC = _int("RESPONSE_WATCHDOG_FIRST_SEC", 5)
@@ -91,26 +64,6 @@ RESPONSE_LEAD_SILENCE_MS = _int("RESPONSE_LEAD_SILENCE_MS", 250)
 # 本応答が生成されるまでの無音区間を埋める。
 ENABLE_FILLER = os.getenv("ENABLE_FILLER", "false").strip().lower() == "true"
 FILLER_AUDIO_PATH = os.getenv("FILLER_AUDIO_PATH", "assets/audio/aizuchi_kashikomarimashita.ulaw")
-
-# 切断主体の推定記録（修正指示書パートA）。trueのときのみ /call-status を受け付け、
-# 通話終了時に [DISCONNECT] 分類ログを1行出す。分類はサーバー内部状態
-# （OA接続到達・VAD発話有無・mark進捗）が主で、Twilioのコールバックは補助情報。
-# Twilioは「どちらが切ったか」を返さないため、あくまで推定である点に注意。
-DISCONNECT_TRACKING_ENABLED = os.getenv("DISCONNECT_TRACKING_ENABLED", "false").strip().lower() == "true"
-
-# 録音開始のリトライ（修正指示書パートB）。通話がin-progressへ完全に遷移する前に
-# recordings.create()を叩くとTwilioは21220（Requested resource is not eligible
-# for recording）で拒否する。安全側の修正のためデフォルトで有効。
-RECORDING_RETRY_ENABLED = os.getenv("RECORDING_RETRY_ENABLED", "true").strip().lower() == "true"
-RECORDING_MAX_RETRIES = _int("RECORDING_MAX_RETRIES", 4)
-RECORDING_RETRY_BACKOFF_MS = _int("RECORDING_RETRY_BACKOFF_MS", 300)
-
-# イベントループのブロック監視（最終安全網）。ループ外の別スレッドから
-# ハートビートの鮮度を見張り、停止していればプロセスを落として再起動させる。
-# 閾値は「正常な処理では絶対に到達しない値」であることが重要（誤発火すると
-# 進行中の他通話を巻き添えにする）。15秒より短くしないこと。
-LOOP_HEARTBEAT_ENABLED = os.getenv("LOOP_HEARTBEAT_ENABLED", "true").strip().lower() == "true"
-LOOP_HEARTBEAT_STALL_SEC = _float("LOOP_HEARTBEAT_STALL_SEC", 15.0)
 
 # 挨拶の即時再生（改善指示書「挨拶即時再生」）: 挨拶は事前生成済みクリップを
 # Media Streamの`start`受信直後に再生し、OpenAI接続を待たない。

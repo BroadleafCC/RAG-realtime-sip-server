@@ -12,7 +12,6 @@ silence_watchdog / max_duration_watchdog / response_watchdog を互いに
 import asyncio
 import logging
 import time
-import traceback
 
 import call_logger
 import config
@@ -100,70 +99,6 @@ async def max_duration_watchdog(session):
     raise CallEnded("max_duration")
 
 
-async def pump_stall_watchdog(session, twilio_ws):
-    """mediaフレーム処理の「進捗」を直接監視する（2026-08-05 pump停止障害）。
-
-    既存の安全網には構造的な盲点があった：`silence_watchdog` はVAD状態が
-    IDLEでないと発火できない。pumpがawaitハングで止まると `TurnDetector.update()`
-    が呼ばれなくなり、状態はSPEECH_STARTED直後のSPEAKINGに固着する。結果、
-    無音ウォッチドッグは永久にcontinueし続け、発火できない。実際にこれで
-    「無反応のまま切電もされない」通話が発生した。
-
-    このウォッチドッグは状態を一切見ず、「最後にフレームを処理し終えた時刻」
-    だけを見る。**状態が固着しても進捗の停止は必ず観測できる**ため、ハングの
-    原因・場所を問わず捕捉できる。
-
-    発火時は (1)pumpタスクのスタックをダンプして止まったawaitを名指しし、
-    (2)OpenAIを経由しない縮退運転（クリップ→切電→ケース作成）で通話を必ず畳む。
-    """
-    import call_session  # 循環import回避のための遅延import（既にロード済み）
-
-    while True:
-        await asyncio.sleep(1)
-
-        if session.last_frame_processed_at is None:
-            continue  # まだ1フレームも処理していない（開始直後）
-        if session.degrade_started:
-            # 別経路が既に縮退運転中。ここで割り込むとケース作成を中断させて
-            # しまうため、進捗が止まって見えても手を出さない。
-            continue
-
-        stalled_sec = time.monotonic() - session.last_frame_processed_at
-        if stalled_sec < config.PUMP_STALL_SEC:
-            continue
-
-        logger.error(
-            "[PUMP-STALL] mediaフレーム処理が %.1f秒 進んでいません。"
-            "pumpタスクのスタックを出力し、縮退運転で通話を終了します。 call_sid=%s",
-            stalled_sec, session.call_sid,
-        )
-        _dump_pump_task_stack(session)
-        await call_session.degrade_and_end(session, twilio_ws, reason="pump_stall")
-
-
-def _dump_pump_task_stack(session) -> None:
-    """pumpタスクが今どのawaitで止まっているかをログに吐く（原因特定器）。
-
-    このスタックの最深フレームが、ハングしているawaitの行を名指しする。
-    候補は append_audio（OpenAI送信のバックプレッシャー）/ VAD推論のexecutor /
-    receive_text（Twilio側の半死）の3つで、ログからは区別できなかった。
-    """
-    task = getattr(session, "pump_task", None)
-    if task is None:
-        logger.error("[PUMP-STALL] pump_task参照がありません（スタック取得不可）")
-        return
-    try:
-        frames = task.get_stack()
-    except Exception as e:
-        logger.error("[PUMP-STALL] スタック取得に失敗しました: %s", e)
-        return
-    if not frames:
-        logger.error("[PUMP-STALL] pumpタスクのスタックが空です done=%s", task.done())
-        return
-    for frame in frames:
-        logger.error("[PUMP-STALL] pump stack:\n%s", "".join(traceback.format_stack(frame)))
-
-
 async def response_watchdog(session):
     """commit + response.create 送信後、応答が始まらない場合の縮退運転。
     5秒でresponse.createのみ再送（commitは再送しない＝空バッファエラー回避）、
@@ -199,7 +134,6 @@ async def response_watchdog(session):
             session.call_sid,
             session.caller_number,
             True,
-            session.recording_sid,
         )
         session.case_created = True
         call_logger.log_event(

@@ -9,9 +9,6 @@ attach_recording_to_case / create_salesforce_case）をほぼそのまま移植�
   から取得）を呼び出し側が渡す。
 - create_salesforce_case に escalation フラグを追加。応答ウォッチドッグの
   縮退運転パスから呼ばれた場合、Subjectに【AI応対不良・要確認】を付与する。
-- 録音の特定は Call SID 紐付けに固定（修正指示書パートB）。移植元にあった
-  「DateCreated> の時間窓＋直近N件」方式は、録音開始に失敗した通話が別通話の
-  録音を掴む事故を起こしたため撤去した。録音が無い通話は無いと記録する。
 - この関数群は同期（blocking）実装のまま。呼び出し側（call_session.py）が
   `await asyncio.to_thread(create_salesforce_case, ...)` でイベントループを
   塞がないようにする。内部の録音待ちポーリング（最大120秒）は、その
@@ -25,13 +22,13 @@ import logging
 import re
 import threading
 import time as time_module
+from datetime import datetime, timedelta, timezone
 
 import requests
 from openai import OpenAI
 from simple_salesforce import Salesforce
 
 import config
-import twilio_client
 from call_logger import get_cost_settings, log_event, log_usage, update_recording_url
 
 logger = logging.getLogger("salesforce_case")
@@ -73,84 +70,36 @@ def search_account_by_phone(sf_instance, phone):
     return records[0] if records else None
 
 
-NO_RECORDING_REMARKS = (
-    "【通話全文（音声認識）】\n"
-    "録音取得失敗のため通話内容なし（録音の開始に失敗した可能性があります）"
-)
-
-RECORDING_POLL_INTERVAL_SEC = 5
-RECORDING_MAX_WAIT_SEC = 120
-
-
-def _resolve_recording(call_id: str, recording_sid: str = ""):
-    """当該通話の録音が完了するまでポーリングし、そのRecordingを返す（無ければNone）。
-
-    録音の特定は必ず「start_recording が返した Recording SID」→「Call SID 直引き」
-    の順で行い、時間窓での探索は一切しない。以前の `DateCreated>` ＋直近5件方式は、
-    録音開始に失敗した通話が**直前の別通話の録音を掴む**事故を起こした
-    （3本目のケースに2本目の文字起こしが入った）。ここを Call SID 紐付けに
-    固定することで、その混入を構造的に不可能にする（修正指示書パートB）。
-    """
-    if not call_id and not recording_sid:
-        return None
-
-    waited = 0
-    time_module.sleep(RECORDING_POLL_INTERVAL_SEC)
-    waited += RECORDING_POLL_INTERVAL_SEC
-    while waited <= RECORDING_MAX_WAIT_SEC:
-        try:
-            rec = (
-                twilio_client.fetch_recording_by_sid(recording_sid)
-                if recording_sid
-                else twilio_client.fetch_recording_for_call(call_id)
-            )
-        except Exception as e:
-            # 一時的なAPIエラーでポーリング自体を諦めない
-            logger.warning("録音の照会に失敗しました (%s秒経過): %s", waited, e)
-            rec = None
-
-        if rec is not None and rec.status == "completed":
-            logger.info("録音完了を検出 (%s秒後) recording_sid=%s", waited, rec.sid)
-            return rec
-        logger.info(
-            "録音未完了 (%s秒経過) status=%s...",
-            waited, getattr(rec, "status", "not_found"),
-        )
-        time_module.sleep(RECORDING_POLL_INTERVAL_SEC)
-        waited += RECORDING_POLL_INTERVAL_SEC
-    return None
-
-
-def _write_no_recording_remarks(case_id: str) -> None:
-    """録音が存在しない通話のケースに、その旨を明記する。他通話の録音で
-    埋めることは絶対にしない（修正指示書パートB）。"""
-    try:
-        sf = _sf_connect()
-        sf.Case.update(
-            case_id, {"SC_CorrespondenceRemarks__c": NO_RECORDING_REMARKS},
-            headers={'Sforce-Auto-Assign': 'FALSE'},
-        )
-        logger.info("対応備考更新完了（録音無し）: ケース %s", case_id)
-    except Exception as e:
-        logger.error("録音無しの対応備考更新エラー: %s", e)
-
-
-def attach_recording_to_case(case_id: str, call_id: str = "", recording_sid: str = ""):
+def attach_recording_to_case(case_id: str, call_id: str = ""):
     """通話終了後、Twilio録音が完了するまでポーリングしてWhisperで文字起こしし、ケースを更新する"""
     if not config.TWILIO_ACCOUNT_SID or not config.TWILIO_AUTH_TOKEN:
         logger.warning("Twilio認証情報が未設定のため録音URLをスキップします")
         return
     try:
-        rec = _resolve_recording(call_id, recording_sid)
-        if rec is None:
-            logger.warning(
-                "[POSTCALL] 録音無し call_sid=%s : 文字起こしをスキップし"
-                "「録音取得失敗のため通話内容なし」と明記してケースを更新します",
-                call_id,
-            )
-            _write_no_recording_remarks(case_id)
-            return
+        from twilio.rest import Client as TwilioClient
+        twilio = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
 
+        POLL_INTERVAL = 5
+        MAX_WAIT = 120
+        completed = []
+        waited = 0
+        time_module.sleep(POLL_INTERVAL)
+        waited += POLL_INTERVAL
+        while waited <= MAX_WAIT:
+            since = datetime.now(timezone.utc) - timedelta(minutes=30)
+            recordings = twilio.recordings.list(date_created_after=since, limit=5)
+            completed = [r for r in recordings if r.status == "completed"]
+            if completed:
+                logger.info("録音完了を検出 (%s秒後)", waited)
+                break
+            logger.info("録音未完了 (%s秒経過)...", waited)
+            time_module.sleep(POLL_INTERVAL)
+            waited += POLL_INTERVAL
+
+        if not completed:
+            logger.warning("完了済みのTwilio録音が見つかりませんでした")
+            return
+        rec = completed[0]
         proxy_url = (
             f"https://{config.RAILWAY_PUBLIC_DOMAIN}"
             f"/recording/{rec.sid}?token={config.RECORDING_ACCESS_TOKEN}"
@@ -201,7 +150,7 @@ def attach_recording_to_case(case_id: str, call_id: str = "", recording_sid: str
 
 
 def create_salesforce_case(transcript_lines: list, call_id: str = "", phone_number: str = "",
-                            escalation: bool = False, recording_sid: str = ""):
+                            escalation: bool = False):
     full_transcript = "\n".join(transcript_lines) if transcript_lines else "(会話記録なし)"
 
     try:
@@ -278,9 +227,7 @@ def create_salesforce_case(transcript_lines: list, call_id: str = "", phone_numb
         logger.info("Salesforceケース作成成功: %s", case_id)
         log_event(call_id, phone_number, 'case_created', 'SUCCESS', case_id=case_id)
         threading.Thread(
-            target=lambda cid=call_id, csid=case_id, rsid=recording_sid: (
-                attach_recording_to_case(csid, cid, rsid)
-            ),
+            target=lambda cid=call_id, csid=case_id: attach_recording_to_case(csid, cid),
             daemon=True,
         ).start()
         return case_id

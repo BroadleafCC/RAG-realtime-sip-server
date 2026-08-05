@@ -15,7 +15,6 @@ import base64
 import json
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from starlette.websockets import WebSocketDisconnect
@@ -26,12 +25,7 @@ import salesforce_case
 import twilio_client
 import watchdogs
 from audio_convert import ulaw_to_pcm16
-from openai_client import (
-    GREETING_TEXT,
-    OpenAiRealtimeSocket,
-    OpenAiSendTimeout,
-    log_session_echo,
-)
+from openai_client import GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
 from vad import TurnDetector, VadEvent, VadState, VadTransition
 from vad_model import SileroVad
 
@@ -44,14 +38,6 @@ FILLER_ANTI_DOUBLE_SPEECH_NOTICE = (
     "\n\n【システム注記】ユーザーの発話終了直後に短い相槌（「かしこまりました」）が"
     "自動再生されています。あなたの応答をこの相槌の繰り返しから始めないでください。"
     "相槌は言い終えたものとして扱い、続きの内容から話し始めてください。"
-)
-
-# VAD推論専用のスレッドプール（2026-08-05障害の根本治療）。
-# asyncio.to_thread の既定プールは録音開始リトライ（最大約2.4秒スリープ）等の
-# 長時間タスクと共有されるため、そこにVAD推論を載せると録音リトライの巻き添えで
-# 推論が待たされる。短時間・高頻度のVAD推論は専用プールに分離する。
-_vad_executor = ThreadPoolExecutor(
-    max_workers=config.VAD_EXECUTOR_MAX_WORKERS, thread_name_prefix="vad",
 )
 
 _clip_cache: dict[str, bytes] = {}
@@ -139,21 +125,7 @@ class CallSession:
             speech_end_ms=config.VAD_SPEECH_END_MS,
             barge_in_min_ms=config.BARGE_IN_MIN_MS,
         )
-        self.silero = SileroVad(max_buffer_sec=config.VAD_MAX_BUFFER_SEC)
-        # [VAD-DROP] ログの間引き用（毎フレーム出すとログ洪水になる）。
-        self._vad_drop_logged_total = 0
-        self._vad_drop_logged_at = 0.0
-        # VAD推論がワーカースレッド内で返らなくなった連続回数。
-        self._vad_timeout_streak = 0
-
-        # pump停止（awaitハング）検知用（2026-08-05障害）。
-        # last_frame_processed_at は media フレームを1件処理し終えるたびに更新する
-        # 「進捗」の記録。VAD状態や応答期限とは無関係なので、状態が固着しても
-        # 監視が死なない。pump_task は停止位置を名指しするスタックダンプ用の参照。
-        self.last_frame_processed_at: float | None = None
-        self.pump_task: asyncio.Task | None = None
-        # 縮退運転の多重起動ガード（ケースの二重作成を防ぐ）。
-        self.degrade_started = False
+        self.silero = SileroVad()
         self.openai: OpenAiRealtimeSocket | None = None
         self._response_id: str | None = None
 
@@ -203,216 +175,6 @@ class CallSession:
         self.response_deadline: float | None = None
         self.response_watchdog_stage = 0
 
-        # 切断主体の推定（修正指示書パートA）用の観測状態。既存の処理には一切
-        # 割り込まず、既存のログ出力点でフラグを立てるだけ。読み取りは通話終了時の
-        # classify_disconnect() のみ。
-        self.oa_session_established = False   # [OA-CONNECT] session確立 に到達した
-        self.any_speech_detected = False      # VAD SPEECH_STARTED が一度でも出た
-        self.greeting_mark_done = False       # 挨拶クリップの再生完了markが返った
-        self.last_completed_mark = ""         # 最後に再生完了したmark名
-        self.response_count = 0               # 成立した response.done の回数
-        self.call_status_meta: dict = {}      # /call-status から受けたメタ（あれば）
-        self.end_reason = ""                  # CallEnded の理由（切断経路の識別用）
-
-        # 録音（修正指示書パートB）。start_recording が返した Recording SID。
-        # 通話後処理はまずこれを使い、他通話の録音を絶対に掴まないようにする。
-        self.recording_sid = ""
-
-
-# ---------------------------------------------------------------------------
-# 進行中の通話レジストリと、通話開始前に確定する事実の預かり所
-#
-# /voice webhook 起点の非同期処理（OpenAI接続のプリウォーム・録音開始REST）は
-# Media Streamの`start`より前に完了しうる。つまり「call_sidに紐づく事実」が
-# 確定した時点でCallSessionがまだ存在しない瞬間がある。そこで
-#   - CallSessionが既にあれば直接そこへ書く
-#   - まだ無ければ下記の預かり所に置き、通話終了時にCallSessionが回収する
-# という二段構えにしている。どちらもTTLで掃除し、取りこぼしをためない。
-# ---------------------------------------------------------------------------
-_active_sessions: dict[str, CallSession] = {}
-_deferred_facts: dict[str, tuple[float, dict]] = {}
-_DEFERRED_FACT_TTL_SEC = 180
-
-# 参照を保持しないと asyncio.create_task したタスクがGCで消えうるため
-# （録音開始のリトライは数秒走るのでこれが実害になる）、完了まで保持する。
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_background(coro) -> None:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-
-def _stash_fact(call_sid: str, **fields) -> None:
-    """CallSession未登録の間に確定した事実を預かる。"""
-    now = time.monotonic()
-    for sid, (at, _) in list(_deferred_facts.items()):
-        if now - at > _DEFERRED_FACT_TTL_SEC:
-            _deferred_facts.pop(sid, None)
-    _, stashed = _deferred_facts.setdefault(call_sid, (now, {}))
-    stashed.update(fields)
-
-
-def _claim_deferred_facts(session: CallSession) -> None:
-    """預かり所に残っている事実をCallSessionへ取り込む（通話終了時に一度）。"""
-    entry = _deferred_facts.pop(session.call_sid, None)
-    if entry is None:
-        return
-    _, stashed = entry
-    if stashed.get("oa_session_established"):
-        session.oa_session_established = True
-    if stashed.get("recording_sid") and not session.recording_sid:
-        session.recording_sid = stashed["recording_sid"]
-
-
-def _mark_oa_established(call_sid: str) -> None:
-    """OpenAIセッション確立の事実をcall_sid単位で記録する（パートA）。"""
-    if not call_sid:
-        return
-    session = _active_sessions.get(call_sid)
-    if session is not None:
-        session.oa_session_established = True
-    else:
-        _stash_fact(call_sid, oa_session_established=True)
-
-
-def _remember_recording_sid(call_sid: str, recording_sid: str) -> None:
-    """開始できた録音のSIDをcall_sid単位で記録する（パートB）。通話後処理は
-    これを最優先で使い、時間窓での録音探索（＝他通話の録音を掴む原因）を行わない。"""
-    if not call_sid or not recording_sid:
-        return
-    session = _active_sessions.get(call_sid)
-    if session is not None:
-        if not session.recording_sid:
-            session.recording_sid = recording_sid
-        return
-    _stash_fact(call_sid, recording_sid=recording_sid)
-
-
-async def _start_recording_task(call_sid: str) -> None:
-    """録音開始RESTをワーカースレッドで実行し、得たRecording SIDを控える。
-
-    start_recording はリトライ中に time.sleep で待つため、必ず to_thread 経由で
-    呼ぶこと（Media Streamのイベントループを塞がないため。修正指示書パートB）。
-    """
-    recording_sid = await asyncio.to_thread(twilio_client.start_recording, call_sid)
-    if recording_sid:
-        _remember_recording_sid(call_sid, recording_sid)
-
-
-def record_call_status(call_sid: str, payload: dict) -> None:
-    """/call-status（Twilioステータスコールバック）から呼ばれる（パートA）。
-
-    分類ログより後に届くことがある。その場合は既にCallSessionが破棄されている
-    ので、単独ログだけ残す（分類には間に合わなかった旨を明記する）。
-    """
-    session = _active_sessions.get(call_sid)
-    if session is not None:
-        session.call_status_meta = payload
-        return
-    logger.info(
-        "[DISCONNECT] call_sid=%s late_status=%s (state無し・分類には未反映)",
-        call_sid, payload,
-    )
-
-
-# サーバー側の判断で切った経路（watchdogs.CallEnded の理由）。発信側の切断と
-# 混同すると分類の意味が失われるため、最優先で切り分ける。
-_SERVER_INITIATED_END_REASONS = {
-    "silence_timeout",
-    "max_duration",
-    "response_watchdog_escalation",
-    "openai_connect_failure",
-    # 以下はpump停止（awaitハング）対策で追加した終了経路（2026-08-05障害）。
-    "pump_stall",
-    "openai_send_timeout",
-    "twilio_recv_timeout",
-    "vad_executor_stall",
-}
-
-
-def classify_disconnect(state: CallSession) -> tuple[str, str]:
-    """通話終了時の状態から切断カテゴリを推定して返す（修正指示書パートA）。
-
-    戻り値: (category, reason_text)。category は機械判定用の短いラベル、
-    reason_text は人間可読の説明。
-
-    ※ すべて『推定』。Twilioは切断主体（発信側/着信側）を明示しないため、
-    ここで行うのは観測可能な事実（OA接続到達・挨拶再生完了・発話有無・通話長）
-    の合成でしかなく、「発信側がボタンを押した」ことの証明ではない。
-
-    分岐は早期returnのみで書く（elifチェーンで安全装置が死んだ前科があるため）。
-    """
-    duration = 0
-    try:
-        duration = int(state.call_status_meta.get("CallDuration", "0") or "0")
-    except (TypeError, ValueError):
-        duration = 0
-
-    # 0. サーバー側から切った通話。以降の推定は発信側の切断を前提にしているので、
-    #    ここで切り分けないと無音切断等がすべて誤分類される。
-    if state.end_reason in _SERVER_INITIATED_END_REASONS:
-        return (
-            "SERVER_INITIATED_HANGUP",
-            f"サーバー側の判断で切断（要因: {state.end_reason}）。発信側の切断ではない",
-        )
-
-    # 1. OA接続確立前に終わった → 接続前切れ
-    if not state.oa_session_established:
-        return (
-            "PRE_CONNECT_HANGUP",
-            "OpenAIセッション確立前に通話終了。発信側の即時切断、または"
-            "接続コールドスタート中の切断と推定（要録音確認）",
-        )
-
-    # 2. 接続はしたが挨拶すら再生完了せず終わった
-    if not state.greeting_mark_done:
-        return (
-            "HANGUP_DURING_GREETING",
-            "OA接続後・挨拶クリップの再生完了前に通話終了と推定",
-        )
-
-    # 3. 挨拶は流れたが人が一言も話さずに終わった
-    if not state.any_speech_detected:
-        return (
-            "HANGUP_NO_SPEECH",
-            "挨拶再生後・発話検知ゼロで通話終了。無言切りと推定",
-        )
-
-    # 4. 会話が成立した上での終了（正常系 or 途中切れ）。
-    #    Durationが取れていて極端に短い場合のみ途中切れ寄りと注記する。
-    if duration and duration < 5:
-        return (
-            "SHORT_CALL_AFTER_SPEECH",
-            f"発話あり・通話{duration}秒で終了。短時間のため途中切れの可能性",
-        )
-    return (
-        "NORMAL_COMPLETION",
-        f"会話成立後に通話終了（response_count={state.response_count}, "
-        f"last_mark={state.last_completed_mark}）",
-    )
-
-
-def _log_disconnect(session: CallSession) -> None:
-    """通話後処理へ入る直前に、分類結果を1行で出す（修正指示書パートA）。
-    StatusCallbackの到着は待たない（待つと通話後処理を遅らせるうえ、
-    そもそも届かない環境がある）。届いていなければ duration=? になるだけ。"""
-    category, reason = classify_disconnect(session)
-    logger.info(
-        "[DISCONNECT] call_sid=%s category=%s duration=%ss end_reason=%s "
-        "oa_established=%s any_speech=%s greeting_done=%s last_mark=%s "
-        "response_count=%d sip=%s :: 推定 %s",
-        session.call_sid, category,
-        session.call_status_meta.get("CallDuration") or "?",
-        session.end_reason or "-",
-        session.oa_session_established, session.any_speech_detected,
-        session.greeting_mark_done, session.last_completed_mark or "-",
-        session.response_count,
-        session.call_status_meta.get("SipResponseCode") or "-",
-        reason,
-    )
-
 
 async def run(twilio_ws):
     session = CallSession()
@@ -430,12 +192,6 @@ async def run(twilio_ws):
     custom_params = start_block.get("customParameters", {}) or {}
     session.caller_number = custom_params.get("caller", "")
 
-    # call_sid をキーに進行中の通話として登録する。/call-status と、
-    # プリウォーム側で確定した事実（OA接続確立・Recording SID）の受け口になる。
-    if session.call_sid:
-        _active_sessions[session.call_sid] = session
-        _claim_deferred_facts(session)
-
     call_logger.log_event(session.call_sid, session.caller_number, 'to_arrived', 'SUCCESS')
 
     # 挨拶はOpenAI接続を待たず、事前生成クリップを即座に再生する
@@ -451,25 +207,13 @@ async def run(twilio_ws):
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(openai_connection_task(session, twilio_ws, start_received_at))
-            # pumpタスクの参照を持つのは、停止時にスタックをダンプして
-            # 「どのawaitで止まったか」を名指しするため（watchdogs参照）。
-            session.pump_task = tg.create_task(pump_twilio_to_openai(session, twilio_ws))
+            tg.create_task(pump_twilio_to_openai(session, twilio_ws))
             tg.create_task(pump_openai_to_twilio(session, twilio_ws))
             tg.create_task(watchdogs.silence_watchdog(session))
             tg.create_task(watchdogs.max_duration_watchdog(session))
             tg.create_task(watchdogs.response_watchdog(session))
-            if config.PUMP_STALL_WATCHDOG_ENABLED:
-                tg.create_task(watchdogs.pump_stall_watchdog(session, twilio_ws))
-    except* watchdogs.CallEnded as eg:
-        # 終了経路を控えるだけ（切断分類でサーバー起因の切断を切り分けるため）。
-        # 例外処理そのものの挙動は従来どおり「正常終了扱い」で変えない。
-        # サーバー側の切断は、その巻き添えで pump 側が twilio_disconnected を
-        # 併発することがあるため、サーバー起因の理由があればそちらを優先する。
-        reasons = [str(exc) for exc in eg.exceptions]
-        session.end_reason = next(
-            (r for r in reasons if r in _SERVER_INITIATED_END_REASONS),
-            reasons[0] if reasons else "",
-        )
+    except* watchdogs.CallEnded:
+        pass
     except* Exception as eg:
         for exc in eg.exceptions:
             logger.error("[CALL] 予期しないエラーで終了しました: %s", exc)
@@ -480,14 +224,6 @@ async def run(twilio_ws):
                 await session.openai.close()
             except Exception:
                 pass
-
-        # 切断主体の推定ログ（修正指示書パートA）。通話後処理へ入る直前という
-        # 固定位置で出す。StatusCallbackの到着は待たない。
-        _active_sessions.pop(session.call_sid, None)
-        _claim_deferred_facts(session)  # 預かり所に残りがあれば回収して掃除する
-        if config.DISCONNECT_TRACKING_ENABLED:
-            _log_disconnect(session)
-
         # どんな終了経路でも発信元番号を落とさずケースを作る、という
         # 指示書の最優先要件をここで構造的に保証する。応答ウォッチドッグの
         # 縮退運転経路だけは既に自分でケースを作っているのでスキップする。
@@ -495,7 +231,7 @@ async def run(twilio_ws):
             await asyncio.to_thread(
                 salesforce_case.create_salesforce_case,
                 session.transcript_lines, session.call_sid, session.caller_number,
-                False, session.recording_sid,
+                False,
             )
 
 
@@ -511,163 +247,10 @@ async def _wait_for_start(twilio_ws) -> dict:
             logger.warning("[CALL] start前に想定外のイベント: %s", data.get("event"))
 
 
-# 縮退運転の各段階の上限。ここで粘っても発信者が沈黙を聞かされるだけなので
-# 短く切り上げ、切電とケース作成へ進む。
-_DEGRADE_CLIP_TIMEOUT_SEC = 8.0
-# markの折り返し後、電話網を通じて実際に耳へ届くまでの猶予。
-_DEGRADE_SETTLE_SEC = 1.0
-
-
-def _degrade_wait_sec(clip_path: str) -> float:
-    """縮退クリップの再生完了(mark)を待つ上限秒数。
-
-    クリップのμ-law 8kHzバイト数から実再生時間を求め、Twilio側の再生遅延ぶんの
-    余裕を足す。markが返らない経路（pump自身から縮退した場合）でも、この時間を
-    待てば音声は発信者に届き切っている。
-    """
-    clip_sec = len(_load_static_clip(clip_path)) / 8000.0
-    return min(_DEGRADE_CLIP_TIMEOUT_SEC, clip_sec + _DEGRADE_SETTLE_SEC + 1.0)
-
-
-async def degrade_and_end(session: CallSession, twilio_ws, reason: str) -> None:
-    """OpenAIを一切経由せずに通話を畳む共通経路（2026-08-05 pump停止障害）。
-
-    事前録音クリップ（Twilio wsへ直接送信）→切電→ケース作成→CallEnded。
-
-    **安全網は、故障を疑っている相手に依存してはならない。** 既存の
-    `_say_and_wait_for_goodbye` はフレーズ生成をOpenAIに投げるため、OpenAI
-    ソケットが半死のときは安全網自体がハングし、切電もケース作成も行われな
-    かった（実際にそうなった）。この経路はOpenAIへ一切送信しない。
-
-    各段階をtimeoutとtry/exceptで包み、**どこで失敗しても必ず切電とケース作成
-    まで進む**構造にしてある。「案件を落とさない」を最優先で守る。
-    """
-    if session.degrade_started:
-        # 既に別経路（pumpとwatchdog等）が縮退を始めている。二重にケースを
-        # 作らないよう、ここでは終了だけ伝える。
-        raise watchdogs.CallEnded(reason)
-    session.degrade_started = True
-
-    session.transcript_lines.append(f"(異常検知[{reason}]のため縮退運転で通話を終了しました)")
-    session.is_goodbye = True
-    try:
-        await asyncio.wait_for(
-            _play_clip_with_mark(session, twilio_ws, config.DEGRADED_AUDIO_PATH, mark_prefix="goodbye"),
-            timeout=_DEGRADE_CLIP_TIMEOUT_SEC,
-        )
-        # markの折り返しを待つ。ただしmarkを処理するのはpump自身なので、
-        # この経路がpumpから呼ばれている場合（送信タイムアウト等）markは
-        # 絶対に返らない。一方、フレーム送信はTwilio側にバッファされるだけで
-        # 実再生はこれからなので、即座に切電すると発信者には何も聞こえない。
-        # そこで待ち時間の上限をクリップの実再生時間から決める（markが返れば
-        # 早期に抜け、返らなくても再生ぶんは待ってから切電する）。
-        await asyncio.wait_for(
-            session.goodbye_event.wait(), timeout=_degrade_wait_sec(config.DEGRADED_AUDIO_PATH),
-        )
-        await asyncio.sleep(_DEGRADE_SETTLE_SEC)
-    except Exception as e:
-        logger.warning(
-            "[%s] 縮退クリップの再生を完了できませんでした（切電へ進みます）: %s",
-            reason.upper(), e,
-        )
-
-    await asyncio.to_thread(twilio_client.hangup_call, session.call_sid)
-    await asyncio.to_thread(
-        salesforce_case.create_salesforce_case,
-        session.transcript_lines, session.call_sid, session.caller_number,
-        True, session.recording_sid,
-    )
-    session.case_created = True
-    call_logger.log_event(
-        session.call_sid, session.caller_number, reason, 'FAILURE',
-        f'{reason} により縮退運転で終了しました',
-    )
-    raise watchdogs.CallEnded(reason)
-
-
-# VAD推論のタイムアウトが何回続いたら通話を畳むか。1回のタイムアウトに
-# VAD_FEED_TIMEOUT_SEC（既定2秒）かかるため、3回で約6秒。VADが働いていない
-# 間は発話終了を検知できず会話は既に成立していないので、長く粘る意味はない。
-_VAD_TIMEOUT_STREAK_MAX = 3
-
-
-async def _vad_feed(session: CallSession, pcm16: bytes) -> list[tuple[float, float]]:
-    """Silero VADへ音声を渡し、推論結果を返す（2026-08-05障害の根本治療）。
-
-    `SileroVad.feed` は同期のonnx推論を含む。これをイベントループ上で直接
-    回すと、推論が詰まった際にループ全体がブロックされ、音声中継も無音タイマーも
-    3つのウォッチドッグもまとめて凍結する（＝発話終了が検知されず、切電もされない）。
-    実際にそれが起きたため、推論は専用スレッドプールへ逃がす。
-
-    【厳守】`SileroVad` はスレッドセーフではない。ここは単一の
-    `pump_twilio_to_openai` ループから逐次 `await` されることで、同一通話内の
-    `feed` が同時に複数実行されないことが保証されている。次のフレームは前の
-    `feed` が返るまで処理されない。この逐次性を壊す変更（feedの並行発火）は厳禁。
-    """
-    if not config.VAD_INFERENCE_IN_THREAD:
-        return session.silero.feed(pcm16)
-
-    loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(_vad_executor, session.silero.feed, pcm16)
-    try:
-        results = await asyncio.wait_for(future, timeout=config.VAD_FEED_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        # onnx推論がワーカースレッド内で返ってこない。このフレームのVADは
-        # スキップして通話を継続する（音声のOpenAIへの転送自体は生きている）。
-        # wait_forのキャンセルはスレッド内の推論を止められないため、ワーカーは
-        # 占有されたままになる。プール枯渇まで粘っても会話は成立しないので、
-        # 連続で続いたら縮退運転で畳む。
-        session._vad_timeout_streak += 1
-        logger.error(
-            "[VAD] 推論が%.1f秒返りません（streak=%d）。このフレームのVADをスキップします",
-            config.VAD_FEED_TIMEOUT_SEC, session._vad_timeout_streak,
-        )
-        return []
-    session._vad_timeout_streak = 0
-    return results
-
-
-_VAD_DROP_LOG_INTERVAL_SEC = 5.0
-
-
-def _maybe_log_vad_drop(session: CallSession) -> None:
-    """VADバッファの破棄が発生していることを間引いてログする。
-
-    通常の通話ではこのログは出ない。常態的に出るなら「入力が消費に追いついて
-    いない」＝推論がイベントループから追い出せていない／CPUが足りていない兆候
-    なので、再調査の入口になる。
-    """
-    dropped_total = session.silero.dropped_samples_total
-    if dropped_total <= session._vad_drop_logged_total:
-        return
-    now = time.monotonic()
-    if now - session._vad_drop_logged_at < _VAD_DROP_LOG_INTERVAL_SEC:
-        return
-    logger.warning(
-        "[VAD-DROP] VADバッファ上限(%.1fs)超過により音声を破棄しています "
-        "dropped_total=%dサンプル(%.2fs相当) call_sid=%s",
-        config.VAD_MAX_BUFFER_SEC, dropped_total, dropped_total / 8000.0,
-        session.call_sid,
-    )
-    session._vad_drop_logged_total = dropped_total
-    session._vad_drop_logged_at = now
-
-
 async def pump_twilio_to_openai(session: CallSession, twilio_ws):
     while True:
         try:
-            raw = await asyncio.wait_for(
-                twilio_ws.receive_text(), timeout=config.TWILIO_RECV_TIMEOUT_SEC
-            )
-        except asyncio.TimeoutError:
-            # 通話中のmediaフレームは20ms間隔で常時届く。10秒無受信は
-            # Media Streamの半死（2026-08-05障害の候補3）。ここで抜けないと
-            # 発信者は無限の沈黙を体験する。
-            logger.error(
-                "[PUMP] Twilioから%.0f秒間フレームが届きません。切断扱いにします call_sid=%s",
-                config.TWILIO_RECV_TIMEOUT_SEC, session.call_sid,
-            )
-            raise watchdogs.CallEnded("twilio_recv_timeout")
+            raw = await twilio_ws.receive_text()
         except WebSocketDisconnect:
             raise watchdogs.CallEnded("twilio_disconnected")
 
@@ -681,28 +264,12 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
             # 準備できていない間（改善指示書「挨拶即時再生」3章）はローカルに
             # キューし、接続完了後にopenai_connection_taskがまとめて送る。
             if session._openai_ready.is_set():
-                try:
-                    await session.openai.append_audio(payload_b64)
-                except OpenAiSendTimeout as e:
-                    # 相手が音声を読まなくなった（フロー制御で送信が詰まった）。
-                    # 握りつぶして継続してはいけない。OpenAI故障のシグナルなので
-                    # OpenAIを経由しない経路で通話を畳む（2026-08-05障害）。
-                    logger.error("[PUMP] OpenAIへの音声送信がタイムアウトしました: %s", e)
-                    await degrade_and_end(session, twilio_ws, reason="openai_send_timeout")
+                await session.openai.append_audio(payload_b64)
             else:
                 session._pending_audio_queue.append(payload_b64)
 
             pcm16 = ulaw_to_pcm16(base64.b64decode(payload_b64))
-            vad_results = await _vad_feed(session, pcm16)
-            _maybe_log_vad_drop(session)
-            if session._vad_timeout_streak >= _VAD_TIMEOUT_STREAK_MAX:
-                logger.error(
-                    "[PUMP] VAD推論のタイムアウトが%d回続きました。縮退運転で終了します",
-                    session._vad_timeout_streak,
-                )
-                await degrade_and_end(session, twilio_ws, reason="vad_executor_stall")
-
-            for prob, chunk_sec in vad_results:
+            for prob, chunk_sec in session.silero.feed(pcm16):
                 transition = session.turn_detector.update(
                     prob, chunk_sec * 1000, session.ai_is_speaking
                 )
@@ -721,10 +288,6 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                     )
                 session._last_barge_in_run_ms = transition.elapsed_ms if session.ai_is_speaking else 0.0
 
-            # フレーム1件を処理し終えた事実だけを記録する（pump停止の検知用）。
-            # mark等の他イベントでは更新しない。media処理の進捗のみを見る。
-            session.last_frame_processed_at = time.monotonic()
-
         elif event == "mark":
             mark_name = (data.get("mark") or {}).get("name", "")
             if mark_name and mark_name == session._pending_mark_name:
@@ -732,11 +295,6 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                 # （もう1つの起点はVADのSPEECH_STARTED）。
                 session._pending_mark_name = None
                 session.ai_is_speaking = False
-                # 再生進捗の記録（切断分類用）。response.doneは生成完了でしかない
-                # ため、どこまで実際に聞こえたかの根拠にはmarkだけを使う。
-                session.last_completed_mark = mark_name
-                if mark_name.startswith("greeting_"):
-                    session.greeting_mark_done = True
                 _log_audio_stats(session, mark_name)
                 _refresh_silence_eligibility(session, reason="mark")
                 logger.info("[MARK] name=%s 応答完了", mark_name)
@@ -802,9 +360,6 @@ def _refresh_silence_eligibility(session: CallSession, reason: str | None = None
 async def _handle_vad_event(session: CallSession, twilio_ws, transition: VadTransition) -> None:
     event = transition.event
     if event == VadEvent.SPEECH_STARTED:
-        # 「人が一言でも話したか」の記録（切断分類用）。VADの状態遷移・
-        # しきい値には一切影響しない読み取り専用のフラグ。
-        session.any_speech_detected = True
         _refresh_silence_eligibility(session, reason="speech")
 
     elif event == VadEvent.END_OF_SPEECH:
@@ -940,8 +495,8 @@ def prewarm_openai_connection(call_sid: str) -> None:
     webhook_at = time.monotonic()
     task = asyncio.create_task(_connect_openai_for_call(call_sid))
     _pending_connections[call_sid] = _PendingConnection(task=task, webhook_at=webhook_at)
-    _spawn_background(_cleanup_stale_pending_connection(call_sid))
-    _spawn_background(_start_recording_task(call_sid))
+    asyncio.create_task(_cleanup_stale_pending_connection(call_sid))
+    asyncio.create_task(asyncio.to_thread(twilio_client.start_recording, call_sid))
 
 
 async def _cleanup_stale_pending_connection(call_sid: str) -> None:
@@ -989,9 +544,6 @@ async def _connect_openai_for_call(call_sid: str) -> tuple[OpenAiRealtimeSocket,
     await socket.send_session_update(instructions)
     await _wait_for_session_updated(socket)
     await socket.inject_greeting_said()
-    # 切断分類の最重要フラグ（パートA）。ここに到達していない通話は
-    # 「接続前切れ」に分類される。
-    _mark_oa_established(call_sid)
     logger.info("[OA-CONNECT] session確立 call_sid=%s", call_sid)
     return socket, time.monotonic()
 
@@ -1020,7 +572,7 @@ async def openai_connection_task(session: CallSession, twilio_ws, start_received
                 "[OA-CONNECT] プリウォームされた接続が見つかりません。ここで新規接続します call_sid=%s",
                 session.call_sid,
             )
-            _spawn_background(_start_recording_task(session.call_sid))
+            asyncio.create_task(asyncio.to_thread(twilio_client.start_recording, session.call_sid))
             socket, _ = await asyncio.wait_for(
                 _connect_openai_for_call(session.call_sid), timeout=config.OPENAI_CONNECT_TIMEOUT_SEC
             )
@@ -1037,9 +589,6 @@ async def openai_connection_task(session: CallSession, twilio_ws, start_received
         raise watchdogs.CallEnded("openai_connect_failure")
 
     session.openai = socket
-    # プリウォーム完了がこのセッションの登録より先だった場合の取りこぼし防止
-    # （通常は_mark_oa_established/_claim_deferred_factsのどちらかで既にTrue）。
-    session.oa_session_established = True
     call_logger.log_event(session.call_sid, session.caller_number, 'ws_connected', 'SUCCESS')
 
     queued = session._pending_audio_queue
@@ -1083,7 +632,7 @@ async def _degraded_connection_failure(session: CallSession, twilio_ws) -> None:
     await asyncio.to_thread(
         salesforce_case.create_salesforce_case,
         session.transcript_lines, session.call_sid, session.caller_number,
-        True, session.recording_sid,
+        True,
     )
     session.case_created = True
 
@@ -1125,7 +674,6 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
             session.response_deadline = None
             session.response_watchdog_stage = 0
             session._current_response_done = True
-            session.response_count += 1
             # force_idleでVAD状態がIDLEに戻るが、audio_playing(ai_is_speaking)は
             # markの往復でしか False にならない。ここでは適格性を再評価するのみで、
             # まだ再生中なら計測は始まらない（_refresh_silence_eligibility内で判定）。
