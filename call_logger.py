@@ -251,6 +251,10 @@ def notify_google_chat(call_id, phone, stage, error_msg, timestamp):
         'ws_connected': 'OpenAI Realtime API connection',
         'case_created': 'Salesforce Case作成',
         'response_watchdog_escalation': '応答ウォッチドッグ縮退運転',
+        'pump_stall': '音声処理の停止（pumpハング）',
+        'openai_send_timeout': 'OpenAI送信タイムアウト',
+        'twilio_recv_timeout': 'Twilio音声の受信途絶',
+        'vad_executor_stall': 'VAD推論の停止',
     }
 
     text = f"""警告:ケース漏れの可能性があります！

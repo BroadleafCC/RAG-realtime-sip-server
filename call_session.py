@@ -26,7 +26,12 @@ import salesforce_case
 import twilio_client
 import watchdogs
 from audio_convert import ulaw_to_pcm16
-from openai_client import GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
+from openai_client import (
+    GREETING_TEXT,
+    OpenAiRealtimeSocket,
+    OpenAiSendTimeout,
+    log_session_echo,
+)
 from vad import TurnDetector, VadEvent, VadState, VadTransition
 from vad_model import SileroVad
 
@@ -138,6 +143,17 @@ class CallSession:
         # [VAD-DROP] ログの間引き用（毎フレーム出すとログ洪水になる）。
         self._vad_drop_logged_total = 0
         self._vad_drop_logged_at = 0.0
+        # VAD推論がワーカースレッド内で返らなくなった連続回数。
+        self._vad_timeout_streak = 0
+
+        # pump停止（awaitハング）検知用（2026-08-05障害）。
+        # last_frame_processed_at は media フレームを1件処理し終えるたびに更新する
+        # 「進捗」の記録。VAD状態や応答期限とは無関係なので、状態が固着しても
+        # 監視が死なない。pump_task は停止位置を名指しするスタックダンプ用の参照。
+        self.last_frame_processed_at: float | None = None
+        self.pump_task: asyncio.Task | None = None
+        # 縮退運転の多重起動ガード（ケースの二重作成を防ぐ）。
+        self.degrade_started = False
         self.openai: OpenAiRealtimeSocket | None = None
         self._response_id: str | None = None
 
@@ -308,6 +324,11 @@ _SERVER_INITIATED_END_REASONS = {
     "max_duration",
     "response_watchdog_escalation",
     "openai_connect_failure",
+    # 以下はpump停止（awaitハング）対策で追加した終了経路（2026-08-05障害）。
+    "pump_stall",
+    "openai_send_timeout",
+    "twilio_recv_timeout",
+    "vad_executor_stall",
 }
 
 
@@ -430,11 +451,15 @@ async def run(twilio_ws):
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(openai_connection_task(session, twilio_ws, start_received_at))
-            tg.create_task(pump_twilio_to_openai(session, twilio_ws))
+            # pumpタスクの参照を持つのは、停止時にスタックをダンプして
+            # 「どのawaitで止まったか」を名指しするため（watchdogs参照）。
+            session.pump_task = tg.create_task(pump_twilio_to_openai(session, twilio_ws))
             tg.create_task(pump_openai_to_twilio(session, twilio_ws))
             tg.create_task(watchdogs.silence_watchdog(session))
             tg.create_task(watchdogs.max_duration_watchdog(session))
             tg.create_task(watchdogs.response_watchdog(session))
+            if config.PUMP_STALL_WATCHDOG_ENABLED:
+                tg.create_task(watchdogs.pump_stall_watchdog(session, twilio_ws))
     except* watchdogs.CallEnded as eg:
         # 終了経路を控えるだけ（切断分類でサーバー起因の切断を切り分けるため）。
         # 例外処理そのものの挙動は従来どおり「正常終了扱い」で変えない。
@@ -486,6 +511,86 @@ async def _wait_for_start(twilio_ws) -> dict:
             logger.warning("[CALL] start前に想定外のイベント: %s", data.get("event"))
 
 
+# 縮退運転の各段階の上限。ここで粘っても発信者が沈黙を聞かされるだけなので
+# 短く切り上げ、切電とケース作成へ進む。
+_DEGRADE_CLIP_TIMEOUT_SEC = 8.0
+# markの折り返し後、電話網を通じて実際に耳へ届くまでの猶予。
+_DEGRADE_SETTLE_SEC = 1.0
+
+
+def _degrade_wait_sec(clip_path: str) -> float:
+    """縮退クリップの再生完了(mark)を待つ上限秒数。
+
+    クリップのμ-law 8kHzバイト数から実再生時間を求め、Twilio側の再生遅延ぶんの
+    余裕を足す。markが返らない経路（pump自身から縮退した場合）でも、この時間を
+    待てば音声は発信者に届き切っている。
+    """
+    clip_sec = len(_load_static_clip(clip_path)) / 8000.0
+    return min(_DEGRADE_CLIP_TIMEOUT_SEC, clip_sec + _DEGRADE_SETTLE_SEC + 1.0)
+
+
+async def degrade_and_end(session: CallSession, twilio_ws, reason: str) -> None:
+    """OpenAIを一切経由せずに通話を畳む共通経路（2026-08-05 pump停止障害）。
+
+    事前録音クリップ（Twilio wsへ直接送信）→切電→ケース作成→CallEnded。
+
+    **安全網は、故障を疑っている相手に依存してはならない。** 既存の
+    `_say_and_wait_for_goodbye` はフレーズ生成をOpenAIに投げるため、OpenAI
+    ソケットが半死のときは安全網自体がハングし、切電もケース作成も行われな
+    かった（実際にそうなった）。この経路はOpenAIへ一切送信しない。
+
+    各段階をtimeoutとtry/exceptで包み、**どこで失敗しても必ず切電とケース作成
+    まで進む**構造にしてある。「案件を落とさない」を最優先で守る。
+    """
+    if session.degrade_started:
+        # 既に別経路（pumpとwatchdog等）が縮退を始めている。二重にケースを
+        # 作らないよう、ここでは終了だけ伝える。
+        raise watchdogs.CallEnded(reason)
+    session.degrade_started = True
+
+    session.transcript_lines.append(f"(異常検知[{reason}]のため縮退運転で通話を終了しました)")
+    session.is_goodbye = True
+    try:
+        await asyncio.wait_for(
+            _play_clip_with_mark(session, twilio_ws, config.DEGRADED_AUDIO_PATH, mark_prefix="goodbye"),
+            timeout=_DEGRADE_CLIP_TIMEOUT_SEC,
+        )
+        # markの折り返しを待つ。ただしmarkを処理するのはpump自身なので、
+        # この経路がpumpから呼ばれている場合（送信タイムアウト等）markは
+        # 絶対に返らない。一方、フレーム送信はTwilio側にバッファされるだけで
+        # 実再生はこれからなので、即座に切電すると発信者には何も聞こえない。
+        # そこで待ち時間の上限をクリップの実再生時間から決める（markが返れば
+        # 早期に抜け、返らなくても再生ぶんは待ってから切電する）。
+        await asyncio.wait_for(
+            session.goodbye_event.wait(), timeout=_degrade_wait_sec(config.DEGRADED_AUDIO_PATH),
+        )
+        await asyncio.sleep(_DEGRADE_SETTLE_SEC)
+    except Exception as e:
+        logger.warning(
+            "[%s] 縮退クリップの再生を完了できませんでした（切電へ進みます）: %s",
+            reason.upper(), e,
+        )
+
+    await asyncio.to_thread(twilio_client.hangup_call, session.call_sid)
+    await asyncio.to_thread(
+        salesforce_case.create_salesforce_case,
+        session.transcript_lines, session.call_sid, session.caller_number,
+        True, session.recording_sid,
+    )
+    session.case_created = True
+    call_logger.log_event(
+        session.call_sid, session.caller_number, reason, 'FAILURE',
+        f'{reason} により縮退運転で終了しました',
+    )
+    raise watchdogs.CallEnded(reason)
+
+
+# VAD推論のタイムアウトが何回続いたら通話を畳むか。1回のタイムアウトに
+# VAD_FEED_TIMEOUT_SEC（既定2秒）かかるため、3回で約6秒。VADが働いていない
+# 間は発話終了を検知できず会話は既に成立していないので、長く粘る意味はない。
+_VAD_TIMEOUT_STREAK_MAX = 3
+
+
 async def _vad_feed(session: CallSession, pcm16: bytes) -> list[tuple[float, float]]:
     """Silero VADへ音声を渡し、推論結果を返す（2026-08-05障害の根本治療）。
 
@@ -501,8 +606,25 @@ async def _vad_feed(session: CallSession, pcm16: bytes) -> list[tuple[float, flo
     """
     if not config.VAD_INFERENCE_IN_THREAD:
         return session.silero.feed(pcm16)
+
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_vad_executor, session.silero.feed, pcm16)
+    future = loop.run_in_executor(_vad_executor, session.silero.feed, pcm16)
+    try:
+        results = await asyncio.wait_for(future, timeout=config.VAD_FEED_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        # onnx推論がワーカースレッド内で返ってこない。このフレームのVADは
+        # スキップして通話を継続する（音声のOpenAIへの転送自体は生きている）。
+        # wait_forのキャンセルはスレッド内の推論を止められないため、ワーカーは
+        # 占有されたままになる。プール枯渇まで粘っても会話は成立しないので、
+        # 連続で続いたら縮退運転で畳む。
+        session._vad_timeout_streak += 1
+        logger.error(
+            "[VAD] 推論が%.1f秒返りません（streak=%d）。このフレームのVADをスキップします",
+            config.VAD_FEED_TIMEOUT_SEC, session._vad_timeout_streak,
+        )
+        return []
+    session._vad_timeout_streak = 0
+    return results
 
 
 _VAD_DROP_LOG_INTERVAL_SEC = 5.0
@@ -534,7 +656,18 @@ def _maybe_log_vad_drop(session: CallSession) -> None:
 async def pump_twilio_to_openai(session: CallSession, twilio_ws):
     while True:
         try:
-            raw = await twilio_ws.receive_text()
+            raw = await asyncio.wait_for(
+                twilio_ws.receive_text(), timeout=config.TWILIO_RECV_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            # 通話中のmediaフレームは20ms間隔で常時届く。10秒無受信は
+            # Media Streamの半死（2026-08-05障害の候補3）。ここで抜けないと
+            # 発信者は無限の沈黙を体験する。
+            logger.error(
+                "[PUMP] Twilioから%.0f秒間フレームが届きません。切断扱いにします call_sid=%s",
+                config.TWILIO_RECV_TIMEOUT_SEC, session.call_sid,
+            )
+            raise watchdogs.CallEnded("twilio_recv_timeout")
         except WebSocketDisconnect:
             raise watchdogs.CallEnded("twilio_disconnected")
 
@@ -548,13 +681,26 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
             # 準備できていない間（改善指示書「挨拶即時再生」3章）はローカルに
             # キューし、接続完了後にopenai_connection_taskがまとめて送る。
             if session._openai_ready.is_set():
-                await session.openai.append_audio(payload_b64)
+                try:
+                    await session.openai.append_audio(payload_b64)
+                except OpenAiSendTimeout as e:
+                    # 相手が音声を読まなくなった（フロー制御で送信が詰まった）。
+                    # 握りつぶして継続してはいけない。OpenAI故障のシグナルなので
+                    # OpenAIを経由しない経路で通話を畳む（2026-08-05障害）。
+                    logger.error("[PUMP] OpenAIへの音声送信がタイムアウトしました: %s", e)
+                    await degrade_and_end(session, twilio_ws, reason="openai_send_timeout")
             else:
                 session._pending_audio_queue.append(payload_b64)
 
             pcm16 = ulaw_to_pcm16(base64.b64decode(payload_b64))
             vad_results = await _vad_feed(session, pcm16)
             _maybe_log_vad_drop(session)
+            if session._vad_timeout_streak >= _VAD_TIMEOUT_STREAK_MAX:
+                logger.error(
+                    "[PUMP] VAD推論のタイムアウトが%d回続きました。縮退運転で終了します",
+                    session._vad_timeout_streak,
+                )
+                await degrade_and_end(session, twilio_ws, reason="vad_executor_stall")
 
             for prob, chunk_sec in vad_results:
                 transition = session.turn_detector.update(
@@ -574,6 +720,10 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                         session._last_barge_in_run_ms, config.BARGE_IN_MIN_MS,
                     )
                 session._last_barge_in_run_ms = transition.elapsed_ms if session.ai_is_speaking else 0.0
+
+            # フレーム1件を処理し終えた事実だけを記録する（pump停止の検知用）。
+            # mark等の他イベントでは更新しない。media処理の進捗のみを見る。
+            session.last_frame_processed_at = time.monotonic()
 
         elif event == "mark":
             mark_name = (data.get("mark") or {}).get("name", "")

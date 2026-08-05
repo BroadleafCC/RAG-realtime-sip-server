@@ -62,6 +62,21 @@ VAD_EXECUTOR_MAX_WORKERS = _int("VAD_EXECUTOR_MAX_WORKERS", 4)
 # 推論が実時間から遅れて発話終了判定が遅延するため、超過分は古い側から捨てる。
 VAD_MAX_BUFFER_SEC = _float("VAD_MAX_BUFFER_SEC", 1.0)
 
+# --- awaitハング対策のタイムアウト群（2026-08-05 pump停止障害） ---------------
+# 外部I/Oのawaitは例外を出さずに永久ブロックしうる（WebSocket送信のフロー制御
+# など）。try/exceptはハングを捕らえられないため、タイムアウトで例外に変換する。
+#
+# OpenAI送信: 正常時はµ秒〜ms級。3秒詰まる時点で会話は既に破綻している。
+OPENAI_SEND_TIMEOUT_SEC = _float("OPENAI_SEND_TIMEOUT_SEC", 3.0)
+# Twilio受信: mediaフレームは20ms間隔で常時届く。通話中の10秒無受信はあり得ない。
+TWILIO_RECV_TIMEOUT_SEC = _float("TWILIO_RECV_TIMEOUT_SEC", 10.0)
+# VAD推論: 正常時は数ms。ワーカースレッド内で返らなくなった場合の脱出。
+VAD_FEED_TIMEOUT_SEC = _float("VAD_FEED_TIMEOUT_SEC", 2.0)
+# pump進捗監視: 「フレーム処理が進まない」という事実だけを見る最終安全網。
+# VAD状態にも応答期限にも依存しないため、状態固着でも必ず発火する。
+PUMP_STALL_SEC = _float("PUMP_STALL_SEC", 10.0)
+PUMP_STALL_WATCHDOG_ENABLED = os.getenv("PUMP_STALL_WATCHDOG_ENABLED", "true").strip().lower() == "true"
+
 SILENCE_TIMEOUT_SEC = _int("SILENCE_TIMEOUT_SEC", 10)
 MAX_CALL_DURATION_SEC = _int("MAX_CALL_DURATION_SEC", 300)
 RESPONSE_WATCHDOG_FIRST_SEC = _int("RESPONSE_WATCHDOG_FIRST_SEC", 5)

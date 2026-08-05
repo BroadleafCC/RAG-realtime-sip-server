@@ -176,6 +176,44 @@ Media Streamの`start`受信を待たず `/voice` webhook受信時点で前倒�
 必ず `run_in_executor` / `to_thread` に逃がす（録音RESTでは既にこのパターンを
 使っていたのに、VAD推論に適用が漏れていた）。
 
+## pump停止（awaitハング）の検知と強制復帰
+
+**症状**（VAD推論スレッド化の後も再発）：`[VAD] SPEECH_STARTED` を最後にログが
+途絶え、AIが無反応のまま切電もされない。
+
+**前回診断の訂正**：ハートビート監視（`[LOOP-STALL]`）が稼働していたにも
+かかわらず33秒以上発火しなかった＝**イベントループは生きていた**。よって
+「ループブロック」は誤診で、実体は `pump_twilio_to_openai` タスクが特定の
+`await` から返ってこない**awaitハング**。ハートビートは発火しないことで
+「ループは無実」を証明した（診断器として機能したので維持している）。
+
+**切電されなかった理由＝安全網の設計盲点**：`silence_watchdog` はVAD状態が
+IDLEでないとcontinueする。pumpが止まると `TurnDetector.update()` が呼ばれず
+状態はSPEAKINGに固着し、無音ウォッチドッグは構造的に発火できない。唯一残る
+`max_duration_watchdog` も、その中の `_say_and_wait_for_goodbye` が
+**OpenAI経由**のため、OpenAIソケットが半死だと安全網自体がハングして
+ケース作成にすら到達しなかった。
+
+対策：
+
+| 対策 | 内容 |
+|---|---|
+| 送信タイムアウト | `OpenAiRealtimeSocket._send` に `OPENAI_SEND_TIMEOUT_SEC`（既定3秒）。全送信メソッドがこの1経路を通るので漏れない。超過で `OpenAiSendTimeout` |
+| 受信タイムアウト | `twilio_ws.receive_text()` に `TWILIO_RECV_TIMEOUT_SEC`（既定10秒）。mediaは20ms間隔で常時届くので10秒無受信は異常 |
+| VAD推論タイムアウト | `VAD_FEED_TIMEOUT_SEC`（既定2秒）。当該フレームのVADをスキップして継続し、3回連続で縮退 |
+| pump進捗ウォッチドッグ | `PUMP_STALL_SEC`（既定10秒）。**状態ではなく進捗**（`last_frame_processed_at`）だけを見るため、状態固着でも必ず発火する |
+| 原因特定器 | 発火時に `task.get_stack()` でpumpタスクのスタックを `[PUMP-STALL] pump stack` としてダンプ。**止まっているawaitの行を名指しする** |
+| 縮退経路 | `call_session.degrade_and_end`：クリップ再生→切電→ケース作成→`CallEnded`。**OpenAIへ一切送信しない**（故障を疑う相手に依存しない） |
+
+**再発時の読み方**：`[PUMP-STALL] pump stack` の最深フレームが原因を確定する。
+`append_audio` ならOpenAI側の不良セッション（2回とも起動後1本目の通話で発生
+＝「1発目」相関があり本命仮説）、`receive_text` ならTwilio側、`_vad_feed` なら
+onnx側へ調査が分岐する。
+
+**原則**：外部I/Oのawaitには必ずタイムアウトを付ける。WebSocket送信はフロー
+制御で例外を出さずに永久ブロックしうるため、try/exceptでは捕らえられない。
+ウォッチドッグは「状態」ではなく「進捗」を監視する。
+
 ## 切断主体の推定記録（`DISCONNECT_TRACKING_ENABLED`）
 
 「つながった瞬間に切れた」通話が、サーバーのバグなのか発信側の都合なのかを
