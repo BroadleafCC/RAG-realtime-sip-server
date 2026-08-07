@@ -1,13 +1,19 @@
 """
-3つの独立したタイムアウト監視ループ。
+4つの独立したタイムアウト監視ループ。
 
 指示書の核心的な要件：既存main.pyでは無音タイムアウト判定がVAD状態の
 elifチェーンに巻き込まれて動かなくなるバグがあった。ここでは
-silence_watchdog / max_duration_watchdog / response_watchdog を互いに
-状態を参照しない独立した asyncio タスクとして実装し、構造的に再発を防ぐ。
+silence_watchdog / max_duration_watchdog / response_watchdog /
+media_starvation_watchdog を互いに状態を参照しない独立した asyncio タスクと
+して実装し、構造的に再発を防ぐ。
 
 いずれかが `CallEnded` を送出すると、call_session.py の TaskGroup が
 他の全タスクを道連れにキャンセルする（`except* CallEnded` で正常終了扱い）。
+
+切電時の案内はすべて事前録音クリップ（_play_goodbye_clip）で再生する。
+以前はOpenAIに喋らせていたが、故障時の最後の一言が「故障しているかも
+しれない部品」に依存する構成だったため、2026-08-07障害対応で外部依存の
+ないクリップ方式へ統一した。
 """
 import asyncio
 import logging
@@ -21,34 +27,37 @@ from vad import VadState
 
 logger = logging.getLogger("watchdogs")
 
-SILENCE_TIMEOUT_MESSAGE = "【無音タイムアウト】"
-MAX_DURATION_MESSAGE = "【最大通話時間超過】"
-ESCALATION_PHRASE = (
-    "お電話が遠いようで、うまく聞き取れませんでした。"
-    "この番号に最も近い担当者から改めてご連絡いたしますので、恐れ入りますが一度お電話をお切りください。"
-)
-
 
 class CallEnded(Exception):
     """いずれかの監視ループ/イベントハンドラが通話終了を決定したときに送出する。
     自分自身のhangup処理は送出前に完了させておくこと。"""
 
 
-async def _say_and_wait_for_goodbye(session, text: str, wait_timeout: float = 15.0):
-    """conversation.item.create + response.create でフレーズを言わせ、
-    Twilioのmark折り返し（=goodbye_event、call_session.pyのmarkハンドラが
-    セットする）を待つ。response.doneではなくmarkを待つのは、response.done
-    はサーバー側の音声生成完了でしかなく、電話口での実際の再生完了より
-    大きく先行するため（実測で5秒以上）。OpenAI接続が死んでいる場合でも
-    例外を握りつぶして先に進む（hangupは必ず行う）。"""
+async def _play_goodbye_clip(session, clip_path: str):
+    """事前録音クリップで切電案内を再生し、再生完了(mark折り返し)を待つ。
+    inbound途絶時はmarkの折り返し自体が届かないため、クリップ長+2秒で
+    必ずタイムアウトして先へ進む（outbound送信とTwilio側の再生は
+    inboundと独立に機能する可能性が高い）。循環import回避のため
+    call_sessionは関数内でimportすること。
+
+    markを待つのは、送信完了と電話口での実際の再生完了が最大5秒以上ズレる
+    ため（旧_say_and_wait_for_goodbyeと同じ理由）。"""
+    import call_session as cs  # 循環import回避（トップレベルでimportしない）
     session.is_goodbye = True
+    clip = cs._load_static_clip(clip_path)
+    if not clip:
+        # クリップ未配置。_play_clip_with_markも何も送らずに戻るため、
+        # markは永久に返らない。無駄な待機をせず即座に切電へ進む。
+        logger.warning("[WATCHDOG] 案内クリップが無いため再生を省略します path=%s", clip_path)
+        return
+    wait_sec = max(4.0, len(clip) / 8000.0 + 2.0)
     try:
-        await session.openai.send_text_turn(text)
+        await cs._play_clip_with_mark(session, session.twilio_ws, clip_path, mark_prefix="goodbye")
     except Exception as e:
-        logger.warning("[WATCHDOG] フレーズ送信に失敗しました（続行します）: %s", e)
+        logger.warning("[WATCHDOG] クリップ再生に失敗しました（続行します）: %s", e)
         return
     try:
-        await asyncio.wait_for(session.goodbye_event.wait(), timeout=wait_timeout)
+        await asyncio.wait_for(session.goodbye_event.wait(), timeout=wait_sec)
         # markはTwilioへの送信完了通知であり、電話網を通じて実際に耳に
         # 届くまでのわずかな遅延を見込んで一呼吸置く。
         await asyncio.sleep(1.0)
@@ -80,7 +89,7 @@ async def silence_watchdog(session):
             session.ai_is_speaking, session.turn_detector.state.name,
         )
         session.transcript_lines.append("(無言タイムアウトのため通話を切断しました)")
-        await _say_and_wait_for_goodbye(session, SILENCE_TIMEOUT_MESSAGE)
+        await _play_goodbye_clip(session, config.SILENCE_GOODBYE_AUDIO_PATH)
         twilio_client.hangup_call(session.call_sid)
         call_logger.log_event(session.call_sid, session.caller_number, 'silence_timeout', 'SUCCESS')
         raise CallEnded("silence_timeout")
@@ -93,7 +102,7 @@ async def max_duration_watchdog(session):
 
     logger.info("[MAX DURATION] 最大通話時間 %s秒 に達したため切断します", config.MAX_CALL_DURATION_SEC)
     session.transcript_lines.append(f"(最大通話時間 {config.MAX_CALL_DURATION_SEC}秒 に達したため切断しました)")
-    await _say_and_wait_for_goodbye(session, MAX_DURATION_MESSAGE)
+    await _play_goodbye_clip(session, config.SILENCE_GOODBYE_AUDIO_PATH)
     twilio_client.hangup_call(session.call_sid)
     call_logger.log_event(session.call_sid, session.caller_number, 'max_duration', 'SUCCESS')
     raise CallEnded("max_duration")
@@ -123,9 +132,19 @@ async def response_watchdog(session):
                 logger.warning("[WATCHDOG] response.create再送に失敗: %s", e)
             continue
 
+        # 宣言→即マーキング＆通知→案内→切電→ケース、の順に実行する。
+        # 途中で発信者切電によりこのタスクがキャンセルされても、FAILURE通知は
+        # 送信済みで、finallyが escalation_pending=True を見てケースを作る
+        # （case_createdガードにより二重作成はない）。以前は log_event が
+        # 末尾にあり、切電レースに負けると障害が正常ケースに擬態していた。
         logger.error("[WATCHDOG] 応答ウォッチドッグ縮退運転を開始します（OpenAI応答なし）")
+        session.escalation_pending = True
+        call_logger.log_event(
+            session.call_sid, session.caller_number,
+            'response_watchdog_escalation', 'FAILURE', 'OpenAIから応答が届きませんでした',
+        )
         session.transcript_lines.append("(応答が届かないため縮退運転に切り替えました)")
-        await _say_and_wait_for_goodbye(session, ESCALATION_PHRASE, wait_timeout=8.0)
+        await _play_goodbye_clip(session, config.ESCALATION_AUDIO_PATH)
         twilio_client.hangup_call(session.call_sid)
 
         await asyncio.to_thread(
@@ -136,8 +155,43 @@ async def response_watchdog(session):
             True,
         )
         session.case_created = True
+        raise CallEnded("response_watchdog_escalation")
+
+
+async def media_starvation_watchdog(session):
+    """Twilio→サーバーのメディアフレームが途絶した場合の縮退運転
+    （2026-08-07障害: 通話4.8〜9.8秒でinboundが停止し、VADがSPEAKING固着
+    →全監視が沈黙した）。他のどの状態にも依存しない独立ループ。
+    フレームが届かない限りVADは遷移しないため、既存の無音ウォッチドッグの
+    「SPEAKING固着では発火できない」盲点もこれが構造的にカバーする。
+
+    根本原因（Twilio/経路側のストリーム停止）はサーバーからは治せないため、
+    目的は被害の最小化と可視化に絞る。"""
+    if not config.ENABLE_MEDIA_STARVATION_WATCHDOG:
+        return
+    while True:
+        await asyncio.sleep(1)
+        if not session.greeting_done or session.last_media_at is None:
+            continue
+        gap = time.monotonic() - session.last_media_at
+        if gap < config.MEDIA_STARVATION_TIMEOUT_SEC:
+            continue
+
+        logger.error(
+            "[MEDIA-STARVATION] メディア入力が%.1f秒途絶。縮退運転に切り替えます "
+            "(vad_state=%s ai_is_speaking=%s)",
+            gap, session.turn_detector.state.name, session.ai_is_speaking,
+        )
+        # 宣言時点で先にマーキングと通知を確定させる（切電に先を越されても
+        # 失われない）。ケース作成はcall_session.runのfinallyが
+        # escalation_pending を引き継いで行う。
+        session.escalation_pending = True
         call_logger.log_event(
             session.call_sid, session.caller_number,
-            'response_watchdog_escalation', 'FAILURE', 'OpenAIから応答が届きませんでした',
+            'media_starvation', 'FAILURE',
+            f'{gap:.1f}秒間inboundフレームなし (vad={session.turn_detector.state.name})',
         )
-        raise CallEnded("response_watchdog_escalation")
+        session.transcript_lines.append("(メディア入力が途絶したため縮退運転に切り替えました)")
+        await _play_goodbye_clip(session, config.ESCALATION_AUDIO_PATH)
+        twilio_client.hangup_call(session.call_sid)
+        raise CallEnded("media_starvation")

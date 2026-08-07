@@ -57,6 +57,21 @@ CLIPS = [
         "speed": 1.0,
         "output": "degraded_konzatsu.ulaw",
     },
+    # 以下2本は2026-08-07障害対応で追加。切電案内をOpenAI非依存にするため、
+    # 無音・最大通話時間・縮退運転（応答なし／メディア入力途絶）の各経路で
+    # これらのクリップを再生する（watchdogs._play_goodbye_clip）。
+    {
+        "name": "無音・最大時間の切電案内",
+        "text": "お声が聞こえませんので失礼いたします。ありがとうございました。",
+        "speed": 1.0,
+        "output": "silence_goodbye.ulaw",
+    },
+    {
+        "name": "聞き取り不能時の縮退運転案内",
+        "text": "お電話が遠いようで、うまく聞き取れませんでした。この番号の担当者から改めてご連絡いたしますので、恐れ入りますが一度お電話をお切りください。",
+        "speed": 1.0,
+        "output": "escalation_kikitorenai.ulaw",
+    },
 ]
 
 

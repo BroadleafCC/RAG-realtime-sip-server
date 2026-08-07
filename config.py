@@ -72,3 +72,17 @@ GREETING_AUDIO_PATH = os.getenv("GREETING_AUDIO_PATH", "assets/audio/greeting_o_
 # ケース作成）に切り替える。
 OPENAI_CONNECT_TIMEOUT_SEC = _int("OPENAI_CONNECT_TIMEOUT_SEC", 5)
 DEGRADED_AUDIO_PATH = os.getenv("DEGRADED_AUDIO_PATH", "assets/audio/degraded_konzatsu.ulaw")
+
+# メディア入力途絶の検知（2026-08-07障害対応）。通常時は無音でも50フレーム/秒
+# 届くため、この秒数フレームが来なければ確実に異常。
+MEDIA_STARVATION_TIMEOUT_SEC = _float("MEDIA_STARVATION_TIMEOUT_SEC", 5.0)
+ENABLE_MEDIA_STARVATION_WATCHDOG = os.getenv("ENABLE_MEDIA_STARVATION_WATCHDOG", "true").strip().lower() == "true"
+
+# 縮退運転・タイムアウト切電の案内クリップ。ファイルが無い場合は既存の
+# _load_static_clip の仕様どおり再生をスキップして処理は続行される。
+SILENCE_GOODBYE_AUDIO_PATH = os.getenv("SILENCE_GOODBYE_AUDIO_PATH", "assets/audio/silence_goodbye.ulaw")
+ESCALATION_AUDIO_PATH = os.getenv("ESCALATION_AUDIO_PATH", "assets/audio/escalation_kikitorenai.ulaw")
+
+# 検証専用: 指定秒数経過後、受信mediaフレームを意図的に無視して途絶を再現する。
+# 0で無効（本番は必ず0）。
+DEBUG_DROP_MEDIA_AFTER_SEC = _float("DEBUG_DROP_MEDIA_AFTER_SEC", 0.0)

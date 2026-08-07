@@ -64,10 +64,12 @@ def _load_static_clip(path: str) -> bytes:
 
 
 def preload_static_clips() -> None:
-    """起動時に静的音声クリップ（挨拶・縮退運転案内・相槌）を読み込み、
-    通話中の初回再生での遅延を避ける（main.pyのlifespanから呼ぶ）。"""
+    """起動時に静的音声クリップ（挨拶・縮退運転案内・切電案内・相槌）を
+    読み込み、通話中の初回再生での遅延を避ける（main.pyのlifespanから呼ぶ）。"""
     _load_static_clip(config.GREETING_AUDIO_PATH)
     _load_static_clip(config.DEGRADED_AUDIO_PATH)
+    _load_static_clip(config.SILENCE_GOODBYE_AUDIO_PATH)
+    _load_static_clip(config.ESCALATION_AUDIO_PATH)
     if config.ENABLE_FILLER:
         _load_static_clip(config.FILLER_AUDIO_PATH)
 
@@ -118,6 +120,16 @@ class CallSession:
         self.is_goodbye = False
         self.case_created = False
         self.goodbye_event = asyncio.Event()
+
+        # メディア入力途絶ウォッチドッグ用（2026-08-07障害対応）。
+        # twilio_ws は run() が start 受信後にセットし、watchdogs 側が
+        # 案内クリップの再生に使う。last_media_at は media フレーム受信ごとに
+        # 更新し、escalation_pending は縮退運転を宣言した時点で True にする
+        # （発信者切電に先を越されても finally のケース作成へ引き継がれる）。
+        self.twilio_ws = None
+        self.last_media_at: float | None = None
+        self.escalation_pending = False
+        self._call_started_at = time.monotonic()
 
         self.turn_detector = TurnDetector(
             threshold=config.VAD_THRESHOLD,
@@ -191,6 +203,9 @@ async def run(twilio_ws):
     session.call_sid = start_block.get("callSid", "")
     custom_params = start_block.get("customParameters", {}) or {}
     session.caller_number = custom_params.get("caller", "")
+    session.twilio_ws = twilio_ws
+    session.last_media_at = start_received_at
+    session._call_started_at = start_received_at
 
     call_logger.log_event(session.call_sid, session.caller_number, 'to_arrived', 'SUCCESS')
 
@@ -212,8 +227,10 @@ async def run(twilio_ws):
             tg.create_task(watchdogs.silence_watchdog(session))
             tg.create_task(watchdogs.max_duration_watchdog(session))
             tg.create_task(watchdogs.response_watchdog(session))
-    except* watchdogs.CallEnded:
-        pass
+            tg.create_task(watchdogs.media_starvation_watchdog(session))
+    except* watchdogs.CallEnded as eg:
+        for exc in eg.exceptions:
+            logger.info("[CALL] 通話終了: %s", exc)
     except* Exception as eg:
         for exc in eg.exceptions:
             logger.error("[CALL] 予期しないエラーで終了しました: %s", exc)
@@ -228,10 +245,14 @@ async def run(twilio_ws):
         # 指示書の最優先要件をここで構造的に保証する。応答ウォッチドッグの
         # 縮退運転経路だけは既に自分でケースを作っているのでスキップする。
         if not session.case_created:
+            # escalation は False 固定ではなく、縮退運転を宣言した経路
+            # （メディア入力途絶など）からフラグを引き継ぐ。発信者切電が
+            # 縮退処理より先に来ても【AI応対不良・要確認】マーキングが
+            # 失われないようにするため（2026-08-07障害対応）。
             await asyncio.to_thread(
                 salesforce_case.create_salesforce_case,
                 session.transcript_lines, session.call_sid, session.caller_number,
-                False,
+                session.escalation_pending,
             )
 
 
@@ -252,12 +273,23 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
         try:
             raw = await twilio_ws.receive_text()
         except WebSocketDisconnect:
+            logger.info("[CALL] Twilio WebSocket切断を検知（発信者切電の可能性）")
             raise watchdogs.CallEnded("twilio_disconnected")
 
         data = json.loads(raw)
         event = data.get("event")
 
         if event == "media":
+            # メディア入力途絶ウォッチドッグの生存信号（2026-08-07障害対応）。
+            # 通常時は無音でも50フレーム/秒届くため、これが数秒止まれば異常。
+            session.last_media_at = time.monotonic()
+            if config.DEBUG_DROP_MEDIA_AFTER_SEC > 0 and \
+                    time.monotonic() - session._call_started_at > config.DEBUG_DROP_MEDIA_AFTER_SEC:
+                # 検証専用: 実機でinbound途絶を意図的に起こす手段がないため、
+                # ここでフレームを捨てて途絶を偽装する（本番はENVを0にすること）。
+                session.last_media_at = time.monotonic() - 999
+                continue
+
             payload_b64 = data["media"]["payload"]
             # VAD状態に関わらず常時転送する（発話開始直後の音の頭切れを
             # 防ぐため。既存main.pyの設計思想を踏襲）。OpenAI接続がまだ
@@ -306,6 +338,7 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                 logger.info("[MARK] name=%s (無効化済みのため無視)", mark_name)
 
         elif event == "stop":
+            logger.info("[CALL] Twilio stopイベント受信（通話終了）")
             raise watchdogs.CallEnded("twilio_stop")
         # 'connected'（再送されうる）や未知イベントは無視する
 
