@@ -86,8 +86,15 @@ def attach_recording_to_case(case_id: str, call_id: str = ""):
         time_module.sleep(POLL_INTERVAL)
         waited += POLL_INTERVAL
         while waited <= MAX_WAIT:
-            since = datetime.now(timezone.utc) - timedelta(minutes=30)
-            recordings = twilio.recordings.list(date_created_after=since, limit=5)
+            if call_id:
+                # CallSidで直接引く。時刻ベースの一覧取得だと通話が近接した
+                # 場合に別通話の録音を拾いうる（実発生あり）ため、構造的に
+                # 混入しない形にする。
+                recordings = twilio.calls(call_id).recordings.list(limit=5)
+            else:
+                # フォールバック（原則到達しない）: 従来の時刻ベース
+                since = datetime.now(timezone.utc) - timedelta(minutes=30)
+                recordings = twilio.recordings.list(date_created_after=since, limit=5)
             completed = [r for r in recordings if r.status == "completed"]
             if completed:
                 logger.info("録音完了を検出 (%s秒後)", waited)

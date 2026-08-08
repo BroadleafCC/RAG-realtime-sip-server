@@ -9,6 +9,8 @@ import base64
 import json
 import logging
 import math
+import threading
+import time
 
 from twilio.rest import Client as TwilioClient
 
@@ -68,15 +70,35 @@ def _get_client() -> TwilioClient:
     return _client
 
 
-def start_recording(call_sid: str):
-    """start イベント受信時に呼ぶ。Media Streams通話は自動録音されないため
-    明示的に開始する（既存main.py/Whisperパイプラインが録音URLを前提とする
-    ため必須）。"""
-    try:
-        _get_client().calls(call_sid).recordings.create()
-        logger.info("[RECORDING] started call_sid=%s", call_sid)
-    except Exception as e:
-        logger.warning("[RECORDING] failed to start call_sid=%s: %s", call_sid, e)
+def start_recording(call_sid: str, retries: int = 3, retry_delay_sec: float = 1.0):
+    """/voice webhook受信時に呼ぶ。Media Streams通話は自動録音されないため
+    明示的に開始する（Whisperパイプラインが録音URLを前提とするため必須）。
+
+    初回は呼び出し元のスレッドで即時実行し（挨拶より前に録音を開始できている
+    実績を維持する）、失敗時のみdaemonスレッドでリトライする。21220
+    (Call is not in-progress) はwebhook直後の状態レースで起こるため、1秒後の
+    再試行でほぼ解消する。リトライはwebhook応答・メディア処理を一切
+    ブロックしない。"""
+    def _attempt(n: int) -> bool:
+        try:
+            _get_client().calls(call_sid).recordings.create()
+            logger.info("[RECORDING] started call_sid=%s (attempt %d)", call_sid, n)
+            return True
+        except Exception as e:
+            logger.warning("[RECORDING] start failed call_sid=%s attempt=%d: %s", call_sid, n, e)
+            return False
+
+    if _attempt(1):
+        return
+
+    def _retry_loop():
+        for n in range(2, retries + 1):
+            time.sleep(retry_delay_sec)
+            if _attempt(n):
+                return
+        logger.error("[RECORDING] 全リトライ失敗 call_sid=%s（録音なしで続行）", call_sid)
+
+    threading.Thread(target=_retry_loop, daemon=True).start()
 
 
 def hangup_call(call_sid: str):
