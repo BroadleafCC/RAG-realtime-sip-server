@@ -16,6 +16,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from starlette.websockets import WebSocketDisconnect
 
@@ -131,6 +132,13 @@ class CallSession:
         self.escalation_pending = False
         self._call_started_at = time.monotonic()
 
+        # 受信フレームレートの計装（Twilio調査用の一次証拠）。stream_started_*
+        # を基準に「ストリーム開始から何秒後にmediaが止まったか」を
+        # [MEDIA-STARVATION] ログへ直接出せるようにする。
+        self.stream_started_mono: float | None = None
+        self.stream_started_utc: datetime | None = None
+        self.media_frame_count = 0
+
         self.turn_detector = TurnDetector(
             threshold=config.VAD_THRESHOLD,
             speech_start_ms=config.VAD_SPEECH_START_MS,
@@ -206,6 +214,8 @@ async def run(twilio_ws):
     session.twilio_ws = twilio_ws
     session.last_media_at = start_received_at
     session._call_started_at = start_received_at
+    session.stream_started_mono = start_received_at
+    session.stream_started_utc = datetime.now(timezone.utc)
 
     call_logger.log_event(session.call_sid, session.caller_number, 'to_arrived', 'SUCCESS')
 
@@ -228,6 +238,7 @@ async def run(twilio_ws):
             tg.create_task(watchdogs.max_duration_watchdog(session))
             tg.create_task(watchdogs.response_watchdog(session))
             tg.create_task(watchdogs.media_starvation_watchdog(session))
+            tg.create_task(watchdogs.media_rate_reporter(session))
     except* watchdogs.CallEnded as eg:
         for exc in eg.exceptions:
             logger.info("[CALL] 通話終了: %s", exc)
@@ -287,9 +298,12 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                     time.monotonic() - session._call_started_at > config.DEBUG_DROP_MEDIA_AFTER_SEC:
                 # 検証専用: 実機でinbound途絶を意図的に起こす手段がないため、
                 # ここでフレームを捨てて途絶を偽装する（本番はENVを0にすること）。
+                # media_frame_countも進めないので、[MEDIA-RATE]は実際の途絶と
+                # 同じく50→0の推移を示す。
                 session.last_media_at = time.monotonic() - 999
                 continue
 
+            session.media_frame_count += 1
             payload_b64 = data["media"]["payload"]
             # VAD状態に関わらず常時転送する（発話開始直後の音の頭切れを
             # 防ぐため。既存main.pyの設計思想を踏襲）。OpenAI接続がまだ

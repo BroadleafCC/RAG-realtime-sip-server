@@ -18,6 +18,7 @@ media_starvation_watchdog を互いに状態を参照しない独立した async
 import asyncio
 import logging
 import time
+from datetime import timedelta
 
 import call_logger
 import config
@@ -177,10 +178,22 @@ async def media_starvation_watchdog(session):
         if gap < config.MEDIA_STARVATION_TIMEOUT_SEC:
             continue
 
+        # Twilioへの報告（「ストリーム開始から何秒後にmediaが止まったか」）を
+        # ログから直読できるよう、最終フレームの位置を経過秒とUTC時刻の両方で
+        # 出す。stream_started_* が未設定の場合でもログは必ず出す。
+        if session.stream_started_mono is not None and session.stream_started_utc is not None:
+            last_offset = session.last_media_at - session.stream_started_mono
+            last_utc = session.stream_started_utc + timedelta(seconds=last_offset)
+            last_utc_str = last_utc.strftime("%H:%M:%S.%f")[:-3]
+        else:
+            last_offset = float("nan")
+            last_utc_str = "n/a"
         logger.error(
             "[MEDIA-STARVATION] メディア入力が%.1f秒途絶。縮退運転に切り替えます "
-            "(vad_state=%s ai_is_speaking=%s)",
-            gap, session.turn_detector.state.name, session.ai_is_speaking,
+            "(最終フレーム=ストリーム開始+%.1fs / %s UTC / 総受信=%dframes, "
+            "vad_state=%s ai_is_speaking=%s)",
+            gap, last_offset, last_utc_str, session.media_frame_count,
+            session.turn_detector.state.name, session.ai_is_speaking,
         )
         # 宣言時点で先にマーキングと通知を確定させる（切電に先を越されても
         # 失われない）。ケース作成はcall_session.runのfinallyが
@@ -195,3 +208,21 @@ async def media_starvation_watchdog(session):
         await _play_goodbye_clip(session, config.ESCALATION_AUDIO_PATH)
         twilio_client.hangup_call(session.call_sid)
         raise CallEnded("media_starvation")
+
+
+async def media_rate_reporter(session):
+    """受信mediaフレーム数をinterval秒ごとにログする観測専用ループ。
+    他のどの状態も参照・変更しない。Twilio調査用の一次証拠
+    （正常時は毎秒~50、途絶時は50→0の推移がそのまま残る）。"""
+    interval = config.MEDIA_RATE_LOG_INTERVAL_SEC
+    if interval <= 0:
+        return
+    prev = 0
+    while True:
+        await asyncio.sleep(interval)
+        if session.stream_started_mono is None:
+            continue
+        total = session.media_frame_count
+        t = time.monotonic() - session.stream_started_mono
+        logger.info("[MEDIA-RATE] t=+%.0fs frames_last=%d total=%d", t, total - prev, total)
+        prev = total

@@ -86,3 +86,7 @@ ESCALATION_AUDIO_PATH = os.getenv("ESCALATION_AUDIO_PATH", "assets/audio/escalat
 # 検証専用: 指定秒数経過後、受信mediaフレームを意図的に無視して途絶を再現する。
 # 0で無効（本番は必ず0）。
 DEBUG_DROP_MEDIA_AFTER_SEC = _float("DEBUG_DROP_MEDIA_AFTER_SEC", 0.0)
+
+# 受信フレームレートのログ間隔（秒）。0で無効。再現キャンペーン中は1、
+# キャンペーン終了後は5に上げるか0で無効化する。
+MEDIA_RATE_LOG_INTERVAL_SEC = _float("MEDIA_RATE_LOG_INTERVAL_SEC", 1.0)
