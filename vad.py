@@ -40,7 +40,7 @@ class TurnDetector:
         self,
         threshold: float = 0.5,
         speech_start_ms: int = 250,
-        speech_end_ms: int = 650,
+        speech_end_ms: int = 500,
         barge_in_min_ms: int = 500,
     ):
         self.threshold = threshold
@@ -85,7 +85,7 @@ class TurnDetector:
 
             # AI発話中はバージイン閾値に達するまでメイン状態機械を進めない。
             # ここで進めてしまうと、バージインに満たない短い割り込みが
-            # IDLE->SPEAKING->(無音650ms)->END_OF_SPEECH まで進行し、
+            # IDLE->SPEAKING->(無音ms)->END_OF_SPEECH まで進行し、
             # AIがまだ話している最中に誤ってcommitが送られてしまう。
             return VadTransition(None, self.state, prob, self._barge_in_run_ms)
 
