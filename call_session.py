@@ -83,7 +83,7 @@ def preload_static_clips() -> None:
 # 再生せずに済むよう、クリップは番号のみに絞っている）。
 # 実際の音声はassets/audio/fax_number.ulawとして事前録音済み
 # （openai_client.FAX_NUMBER_TOOL参照）。
-FAX_SPOKEN_TEXT = "ゼロ、サン、ゴー、ナナ、ハチ、イチ、サン、ニー、ロク、ゼロ。"
+FAX_SPOKEN_TEXT = "ゼロ。サン。ゴー。ナナ。ハチ。イチ。サン。ニー。ロク。ゼロ。"
 FAX_NUMBER_DISPLAY = "03-5781-3260"
 
 # 挨拶を「言い終えたもの」として扱わせるための追加ルール。プロンプトDBの

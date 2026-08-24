@@ -28,6 +28,7 @@ try:
 except ModuleNotFoundError:  # Python 3.13+
     import audioop_lts as audioop
 
+import numpy as np
 from openai import OpenAI
 
 import config
@@ -80,8 +81,12 @@ CLIPS = [
     # するため）。テキストはcall_session.FAX_SPOKEN_TEXTと必ず一致させること。
     {
         "name": "FAX番号案内",
-        "text": "ゼロ、サン、ゴー、ナナ、ハチ、イチ、サン、ニー、ロク、ゼロ。",
-        "speed": 0.75,  # 番号を正確に聞き取れるよう、通常のクリップよりゆっくり読み上げる
+        # speed 0.75/0.9はどちらも音質が明らかに劣化した（gpt-4o-mini-ttsは
+        # speed=1.0から離れるほどノイズが乗りやすい）。他の全クリップと同じ
+        # speed=1.0に統一し、代わりに数字の間の句読点を「、」から「。」に
+        # 変えて間を空けることで聞き取りやすさを確保する。
+        "text": "ゼロ。サン。ゴー。ナナ。ハチ。イチ。サン。ニー。ロク。ゼロ。",
+        "speed": 1.0,
         "output": "fax_number.ulaw",
     },
 ]
@@ -111,10 +116,35 @@ def synthesize(client: OpenAI, text: str, speed: float) -> bytes:
         raise RuntimeError(f"想定外のsampwidth: {sampwidth}")
 
     if framerate != TARGET_SR:
-        pcm, _ = audioop.ratecv(pcm, sampwidth, 1, framerate, TARGET_SR, None)
+        pcm = _lowpass_and_decimate(pcm, framerate, TARGET_SR)
 
     pcm = _trim_silence(pcm, sampwidth)
     return audioop.lin2ulaw(pcm, sampwidth)
+
+
+def _lowpass_and_decimate(pcm16: bytes, orig_sr: int, target_sr: int) -> bytes:
+    """orig_sr(通常24000Hz)からtarget_sr(8000Hz)への整数比ダウンサンプリング。
+
+    audioop.ratecv()は単純な線形補間のみでアンチエイリアシングフィルタを
+    掛けないため、子音の高域成分が折り返しノイズとなって「ガサガサ」した
+    粒状ノイズが乗る（FAX番号クリップで実際に聴感上の問題として報告された）。
+    ここではWindowed-sinc FIRローパスフィルタ（Hamming窓、カットオフ=
+    target_sr/2）を掛けてから間引くことでエイリアシングを防ぐ。
+    """
+    if orig_sr % target_sr != 0:
+        raise ValueError(f"整数比でないサンプルレート変換は未対応: {orig_sr} -> {target_sr}")
+    factor = orig_sr // target_sr
+
+    samples = np.frombuffer(pcm16, dtype=np.int16).astype(np.float64)
+    cutoff = (target_sr / 2) / orig_sr  # 正規化カットオフ周波数（0〜0.5）
+    numtaps = 63
+    n = np.arange(numtaps) - (numtaps - 1) / 2
+    h = np.sinc(2 * cutoff * n) * np.hamming(numtaps)
+    h /= h.sum()
+
+    filtered = np.convolve(samples, h, mode="same")
+    decimated = np.clip(filtered[::factor], -32768, 32767).astype(np.int16)
+    return decimated.tobytes()
 
 
 def _trim_silence(pcm: bytes, sampwidth: int, threshold: int = 400, pad_ms: int = 30) -> bytes:
