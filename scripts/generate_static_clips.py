@@ -72,6 +72,18 @@ CLIPS = [
         "speed": 1.0,
         "output": "escalation_kikitorenai.ulaw",
     },
+    # 印字ズレ対応のFAX番号案内（function calling化対応で追加）。モデルに
+    # その場で数字を読み上げさせると速度が制御できないため、事前録音した
+    # このクリップをcall_session._handle_function_callが再生する。番号のみを
+    # 収録し、「専任の担当者から〜」の案内文は含めない（数字を含まないため
+    # モデル自身に喋らせ、聞き直し要求時にクリップだけを短く再生できるように
+    # するため）。テキストはcall_session.FAX_SPOKEN_TEXTと必ず一致させること。
+    {
+        "name": "FAX番号案内",
+        "text": "ゼロ、サン、ゴー、ナナ、ハチ、イチ、サン、ニー、ロク、ゼロ。",
+        "speed": 0.75,  # 番号を正確に聞き取れるよう、通常のクリップよりゆっくり読み上げる
+        "output": "fax_number.ulaw",
+    },
 ]
 
 

@@ -34,12 +34,34 @@ HIGH_FREQUENCY_EVENT_TYPES = {
 }
 
 
+# FAX番号案内用のfunction calling定義（call_session.py参照）。数字の読み上げ
+# 速度をRealtime APIの音声出力では制御できないため、モデルには喋らせず
+# 事前録音クリップの再生をトリガーさせるだけの引数なし関数にしている。
+FAX_NUMBER_TOOL = {
+    "type": "function",
+    "name": "play_fax_number",
+    "description": (
+        "お客様が印字ズレ対応のFAX送付案内に同意した場合、またはFAX番号の"
+        "聞き直しを求められた場合に呼び出す。呼び出すとFAX番号のみが事前録音"
+        "音声で自動再生される（「専任の担当者から〜」等の案内文は含まれない）。"
+        "この関数を呼ぶときはFAX番号を自分の声で話してはいけない。何も話さず"
+        "この関数だけを呼び出すこと。番号の案内文（「専任の担当者からご連絡"
+        "いたします」等）はこの関数の実行後、あなた自身の声で続けて話すこと。"
+        "聞き直しを求められた場合は、案内文を繰り返さずこの関数だけを"
+        "再度呼び出せばよい。"
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+
 def build_session_update(instructions: str) -> dict:
     return {
         "type": "session.update",
         "session": {
             "type": "realtime",
             "instructions": instructions,
+            "tools": [FAX_NUMBER_TOOL],
+            "tool_choice": "auto",
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
@@ -75,6 +97,21 @@ def build_greeting_said_item() -> dict:
             "type": "message",
             "role": "assistant",
             "content": [{"type": "output_text", "text": GREETING_TEXT}],
+        },
+    }
+
+
+def build_function_call_output_item(call_id: str, output: str) -> dict:
+    """function_call完了後、実行結果をモデルに返すconversation.item.create。
+    これを送るだけでは応答は生成されないため、続けてresponse.createが必要
+    （呼び出し側のsend_function_call_outputは行わない。呼び出し順を明示するため
+    呼び出し元＝call_session.pyで個別にresponse_create()を呼ぶ）。"""
+    return {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
         },
     }
 
@@ -126,6 +163,9 @@ class OpenAiRealtimeSocket:
     async def send_text_turn(self, text: str):
         for item in build_text_item(text):
             await self._send(item)
+
+    async def send_function_call_output(self, call_id: str, output: str):
+        await self._send(build_function_call_output_item(call_id, output))
 
     async def append_audio(self, payload_b64: str):
         await self._send({"type": "input_audio_buffer.append", "audio": payload_b64})

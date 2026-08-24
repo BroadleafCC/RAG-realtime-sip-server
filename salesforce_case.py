@@ -25,6 +25,7 @@ import time as time_module
 from datetime import datetime, timedelta, timezone
 
 import requests
+from itsdangerous import URLSafeTimedSerializer
 from openai import OpenAI
 from simple_salesforce import Salesforce
 
@@ -32,6 +33,16 @@ import config
 from call_logger import get_cost_settings, log_event, log_usage, update_recording_url
 
 logger = logging.getLogger("salesforce_case")
+
+# 録音再生URLの署名・検証に使うシリアライザ。/recording/{token} ルート
+# （main.py）側でも同じシークレットで検証するため共有する。
+link_serializer = URLSafeTimedSerializer(config.RECORDING_LINK_SECRET)
+
+
+def generate_recording_link(recording_sid: str) -> str:
+    """recording_sidを署名付きトークンに変換し、7日間有効な再生URLを返す。"""
+    token = link_serializer.dumps(recording_sid)
+    return f"https://{config.RAILWAY_PUBLIC_DOMAIN}/recording/{token}"
 
 client = OpenAI(api_key=config.OPENAI_API_KEY)
 
@@ -107,12 +118,9 @@ def attach_recording_to_case(case_id: str, call_id: str = ""):
             logger.warning("完了済みのTwilio録音が見つかりませんでした")
             return
         rec = completed[0]
-        proxy_url = (
-            f"https://{config.RAILWAY_PUBLIC_DOMAIN}"
-            f"/recording/{rec.sid}?token={config.RECORDING_ACCESS_TOKEN}"
-        )
+        proxy_url = generate_recording_link(rec.sid)
 
-        remarks = f"【録音URL】\n{proxy_url}"
+        remarks = f"【録音URL】（録音保管期間は1週間です）\n{proxy_url}"
         try:
             audio_url = (
                 f"https://api.twilio.com/2010-04-01/Accounts"
@@ -133,7 +141,7 @@ def attach_recording_to_case(case_id: str, call_id: str = ""):
                 )
                 whisper_text = result.text.strip()
                 logger.info("Whisper文字起こし完了: %s", whisper_text[:60])
-                remarks = f"【通話全文（音声認識）】\n{whisper_text}\n\n【録音URL】\n{proxy_url}"
+                remarks = f"【通話全文（音声認識）】\n{whisper_text}\n\n【録音URL】（録音保管期間は1週間です）\n{proxy_url}"
                 try:
                     duration_sec = float(rec.duration or 0)
                     settings = get_cost_settings()

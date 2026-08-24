@@ -5,11 +5,13 @@ from contextlib import asynccontextmanager
 import requests
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import PlainTextResponse
+from itsdangerous import BadSignature, SignatureExpired
 from starlette.websockets import WebSocketDisconnect
 
 import call_logger
 import call_session
 import config
+from salesforce_case import link_serializer
 
 # Windows上のローカル開発では既定のstdout/stderrエンコーディングがUTF-8で
 # ないことがあり、日本語ログ（通話記録・エラーメッセージ）が文字化けする。
@@ -74,10 +76,14 @@ async def media_stream(websocket: WebSocket):
         logger.error("[MEDIA STREAM] unexpected error: %s", e)
 
 
-@app.get("/recording/{recording_sid}")
-async def recording_proxy(recording_sid: str, token: str = ""):
-    if token != config.RECORDING_ACCESS_TOKEN:
-        return PlainTextResponse("Unauthorized", status_code=401)
+@app.get("/recording/{token}")
+async def recording_proxy(token: str):
+    try:
+        recording_sid = link_serializer.loads(token, max_age=config.RECORDING_LINK_MAX_AGE_SEC)
+    except SignatureExpired:
+        return PlainTextResponse("このリンクの有効期限（発行から7日間）が切れています。", status_code=410)
+    except BadSignature:
+        return PlainTextResponse("不正なリクエストです。", status_code=403)
     twilio_url = (
         f"https://api.twilio.com/2010-04-01/Accounts"
         f"/{config.TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}.mp3"

@@ -6,6 +6,7 @@ python-dotenv
 requests
 simple-salesforce
 twilio
+itsdangerous
 openai
 onnxruntime
 silero-vad-notorch

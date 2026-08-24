@@ -23,7 +23,11 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 # Railway
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-RECORDING_ACCESS_TOKEN = os.getenv("RECORDING_ACCESS_TOKEN", "")
+
+# 録音再生URLの署名鍵。未設定のままデプロイされると「録音URLだけ動かない」
+# という気付きにくい不具合になるため、起動時点で明確に落とす（os.environ[]）。
+RECORDING_LINK_SECRET = os.environ["RECORDING_LINK_SECRET"]
+RECORDING_LINK_MAX_AGE_SEC = 7 * 24 * 60 * 60  # 7日間（168時間）固定。運用決定事項のため定数化
 
 # Salesforce
 SF_USERNAME = os.getenv("SF_USERNAME")
@@ -82,6 +86,11 @@ ENABLE_MEDIA_STARVATION_WATCHDOG = os.getenv("ENABLE_MEDIA_STARVATION_WATCHDOG",
 # _load_static_clip の仕様どおり再生をスキップして処理は続行される。
 SILENCE_GOODBYE_AUDIO_PATH = os.getenv("SILENCE_GOODBYE_AUDIO_PATH", "assets/audio/silence_goodbye.ulaw")
 ESCALATION_AUDIO_PATH = os.getenv("ESCALATION_AUDIO_PATH", "assets/audio/escalation_kikitorenai.ulaw")
+
+# 印字ズレ対応のFAX番号案内。モデルにその場で数字を読み上げさせると速度が
+# 制御できないため、function calling（play_fax_number）で事前録音クリップを
+# 再生する（call_session.py参照）。
+FAX_AUDIO_PATH = os.getenv("FAX_AUDIO_PATH", "assets/audio/fax_number.ulaw")
 
 # 検証専用: 指定秒数経過後、受信mediaフレームを意図的に無視して途絶を再現する。
 # 0で無効（本番は必ず0）。

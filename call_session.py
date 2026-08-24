@@ -26,7 +26,7 @@ import salesforce_case
 import twilio_client
 import watchdogs
 from audio_convert import ulaw_to_pcm16
-from openai_client import GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
+from openai_client import FAX_NUMBER_TOOL, GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
 from vad import TurnDetector, VadEvent, VadState, VadTransition
 from vad_model import SileroVad
 
@@ -65,15 +65,26 @@ def _load_static_clip(path: str) -> bytes:
 
 
 def preload_static_clips() -> None:
-    """起動時に静的音声クリップ（挨拶・縮退運転案内・切電案内・相槌）を
-    読み込み、通話中の初回再生での遅延を避ける（main.pyのlifespanから呼ぶ）。"""
+    """起動時に静的音声クリップ（挨拶・縮退運転案内・切電案内・相槌・FAX番号
+    案内）を読み込み、通話中の初回再生での遅延を避ける（main.pyのlifespanから
+    呼ぶ）。"""
     _load_static_clip(config.GREETING_AUDIO_PATH)
     _load_static_clip(config.DEGRADED_AUDIO_PATH)
     _load_static_clip(config.SILENCE_GOODBYE_AUDIO_PATH)
     _load_static_clip(config.ESCALATION_AUDIO_PATH)
+    _load_static_clip(config.FAX_AUDIO_PATH)
     if config.ENABLE_FILLER:
         _load_static_clip(config.FILLER_AUDIO_PATH)
 
+
+# FAX番号案内クリップの内容（function_call_outputでモデルに文字情報として
+# 返す用）。クリップには番号のみを収録し、「専任の担当者から〜」の案内は
+# 数字を含まないためモデル自身に喋らせる（聞き直し要求時に案内文を毎回
+# 再生せずに済むよう、クリップは番号のみに絞っている）。
+# 実際の音声はassets/audio/fax_number.ulawとして事前録音済み
+# （openai_client.FAX_NUMBER_TOOL参照）。
+FAX_SPOKEN_TEXT = "ゼロ、サン、ゴー、ナナ、ハチ、イチ、サン、ニー、ロク、ゼロ。"
+FAX_NUMBER_DISPLAY = "03-5781-3260"
 
 # 挨拶を「言い終えたもの」として扱わせるための追加ルール。プロンプトDBの
 # 内容に関わらず常に付け足す（改善指示書「挨拶即時再生」2章）。
@@ -526,6 +537,35 @@ async def _play_clip_with_mark(session: CallSession, twilio_ws, path: str, mark_
     await twilio_client.send_mark(twilio_ws, session.stream_sid, mark_name)
 
 
+async def _handle_function_call(session: CallSession, twilio_ws, item: dict) -> None:
+    """response.output_item.doneでfunction_call型のitemを受けたときの処理。
+    FAX番号案内はモデルに読み上げさせず事前録音クリップを再生する（速度を
+    確実に制御するため）。クリップ再生はgreeting/degraded運転と同じ
+    _play_clip_with_markパターンを使うため、item_idはこのitemに紐づいた
+    ままにしておくと後続のバージイン処理がfunction_call itemに対して
+    conversation.item.truncateを送ってしまう。事前にNoneへ戻しておく
+    （挨拶/縮退運転クリップと同じ扱い。_handle_barge_inのコメント参照）。"""
+    session._current_item_id = None
+
+    call_id = item.get("call_id")
+    name = item.get("name")
+    if not call_id or session.openai is None:
+        return
+
+    if name == FAX_NUMBER_TOOL["name"]:
+        await _play_clip_with_mark(session, twilio_ws, config.FAX_AUDIO_PATH, mark_prefix="fax")
+        output = json.dumps(
+            {"number": FAX_NUMBER_DISPLAY, "spoken_text": FAX_SPOKEN_TEXT},
+            ensure_ascii=False,
+        )
+    else:
+        logger.warning("[TOOL] 未知の関数呼び出し name=%s call_id=%s", name, call_id)
+        output = "{}"
+
+    await session.openai.send_function_call_output(call_id, output)
+    await session.openai.response_create()
+
+
 def prewarm_openai_connection(call_sid: str) -> None:
     """/voice webhook受信時点で呼ぶ。OpenAI WebSocket接続・session確立・
     挨拶の会話履歴注入を、Media Streamの`start`受信を待たずに裏で開始して
@@ -711,10 +751,17 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
 
         elif event_type == "response.output_item.added":
             # バージイン時のconversation.item.truncateに必要なitem_idを取得する
-            # （改善指示書「バージイン実装」修正1）。
+            # （改善指示書「バージイン実装」修正1）。function_call型のitemは
+            # 音声を持たずtruncate対象にならないため、type=="message"のときだけ
+            # 記録する（FAX番号案内のfunction calling追加に伴う対応）。
             item = event.get("item") or {}
-            if isinstance(item, dict):
+            if isinstance(item, dict) and item.get("type") == "message":
                 session._current_item_id = item.get("id")
+
+        elif event_type == "response.output_item.done":
+            item = event.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                await _handle_function_call(session, twilio_ws, item)
 
         elif event_type == "response.done":
             session.turn_detector.force_idle()
