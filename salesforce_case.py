@@ -228,8 +228,7 @@ def create_salesforce_case(transcript_lines: list, call_id: str = "", phone_numb
         case_data = {
             'OwnerId': config.SF_CASE_OWNER_ID,
             'RecordTypeId': config.SF_CASE_RECORD_TYPE_ID,
-            'Status': 'New',
-            'Origin': 'Phone',
+            'Status': '進行中',
             'Subject': f"{subject_prefix}{subject}の件について",
             'SC_ContactPerson__c': contact_person,
             'SC_DestinationPhoneNo__c': destination_phone,
