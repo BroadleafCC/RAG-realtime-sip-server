@@ -81,42 +81,7 @@ def search_account_by_phone(sf_instance, phone):
     return records[0] if records else None
 
 
-def _check_head_clip(ai_transcripts: list[str], whisper_text: str) -> None:
-    """AI発話の頭切れを耳ではなく客観的に検出する（改善指示書「レイテンシ回収」
-    修正1の検証方法）。
-
-    各応答についてモデルが「言おうとした文」(response.output_audio_transcript.done
-    のtranscript、call_session.pyが[AI-TRANSCRIPT]としてログ済み)の先頭20文字が、
-    通話後のWhisper文字起こし(＝実際に回線に流れた音)に現れるか確認する。
-    現れない場合、頭切れは「先頭が失われる」現象なので、先頭から1文字ずつ
-    削った部分文字列がWhisper文字起こしに現れるところを探し、それを
-    「実際に聞こえたと推定される内容」としてログに含める。
-
-    音声認識の誤り（同音異字等）により偽陽性が出ることはあるため、これは
-    確定診断ではなく「疑い」の自動記録である。プライミング短縮の実験
-    （AUDIO_PRIMING_MS）の効果検証に使う。
-    """
-    if not whisper_text:
-        return
-    for text in ai_transcripts:
-        head = text[:20]
-        if not head or head in whisper_text:
-            continue
-        actual = None
-        for cut in range(1, len(head)):
-            candidate = head[cut:]
-            if len(candidate) < 4:
-                break
-            if candidate in whisper_text:
-                actual = candidate
-                break
-        logger.warning(
-            '[HEAD-CLIP?] model="%s" actual="%s"',
-            head, actual if actual is not None else "(一致箇所なし)",
-        )
-
-
-def attach_recording_to_case(case_id: str, call_id: str = "", ai_transcripts: list[str] | None = None):
+def attach_recording_to_case(case_id: str, call_id: str = ""):
     """通話終了後、Twilio録音が完了するまでポーリングしてWhisperで文字起こしし、ケースを更新する"""
     if not config.TWILIO_ACCOUNT_SID or not config.TWILIO_AUTH_TOKEN:
         logger.warning("Twilio認証情報が未設定のため録音URLをスキップします")
@@ -177,7 +142,6 @@ def attach_recording_to_case(case_id: str, call_id: str = "", ai_transcripts: li
                 whisper_text = result.text.strip()
                 logger.info("Whisper文字起こし完了: %s", whisper_text[:60])
                 remarks = f"【通話全文（音声認識）】\n{whisper_text}\n\n【録音URL】（録音保管期間は1週間です）\n{proxy_url}"
-                _check_head_clip(ai_transcripts or [], whisper_text)
                 try:
                     duration_sec = float(rec.duration or 0)
                     settings = get_cost_settings()
@@ -277,11 +241,8 @@ def create_salesforce_case(transcript_lines: list, call_id: str = "", phone_numb
         case_id = result['id']
         logger.info("Salesforceケース作成成功: %s", case_id)
         log_event(call_id, phone_number, 'case_created', 'SUCCESS', case_id=case_id)
-        # 頭切れ検証（改善指示書「レイテンシ回収」修正1）用に、この通話で
-        # モデルが発話した各ターンのtranscriptを抜き出して引き継ぐ。
-        ai_transcripts = [line[len("AI: "):] for line in transcript_lines if line.startswith("AI: ")]
         threading.Thread(
-            target=lambda cid=call_id, csid=case_id, ait=ai_transcripts: attach_recording_to_case(csid, cid, ait),
+            target=lambda cid=call_id, csid=case_id: attach_recording_to_case(csid, cid),
             daemon=True,
         ).start()
         return case_id

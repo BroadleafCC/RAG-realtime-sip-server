@@ -1,8 +1,5 @@
-import asyncio
 import logging
-import socket
 import sys
-import time
 from contextlib import asynccontextmanager
 
 import requests
@@ -16,12 +13,6 @@ import call_session
 import config
 from salesforce_case import link_serializer
 
-# OpenAI Realtime APIのWebSocketエンドポイント（openai_client.REALTIME_WS_URL
-# と同じホスト）。リージョン移設の前後でこの数値を比較すれば経路改善の効果が
-# 分かる（改善指示書「レイテンシ回収」修正3-b）。
-OPENAI_RTT_HOST = "api.openai.com"
-OPENAI_RTT_PORT = 443
-
 # Windows上のローカル開発では既定のstdout/stderrエンコーディングがUTF-8で
 # ないことがあり、日本語ログ（通話記録・エラーメッセージ）が文字化けする。
 # Railway(Linux)では通常UTF-8だが、ローカルngrok検証でも文字化けなく
@@ -34,41 +25,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("main")
 
 
-def _measure_rtt_once(host: str, port: int, timeout: float = 5.0) -> float | None:
-    """TCP接続確立にかかった時間(ms)を1回計測する。HTTPリクエストは投げない
-    軽量な経路調査（改善指示書「レイテンシ回収」修正3-b）。失敗時はNone。"""
-    start = time.monotonic()
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            pass
-        return (time.monotonic() - start) * 1000
-    except OSError as e:
-        logger.warning("[RTT] %s:%d への接続に失敗しました: %s", host, port, e)
-        return None
-
-
-def _measure_rtt_avg(host: str, port: int, attempts: int = 3) -> None:
-    samples = [t for t in (_measure_rtt_once(host, port) for _ in range(attempts)) if t is not None]
-    if not samples:
-        logger.warning("[RTT] %s 全%d回の接続に失敗したため計測できませんでした", host, attempts)
-        return
-    logger.info(
-        "[RTT] openai_endpoint avg=%.0fms (%d回計測, samples=%s)",
-        sum(samples) / len(samples), len(samples),
-        ", ".join(f"{s:.0f}ms" for s in samples),
-    )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     call_logger.init_db()
     call_logger.cleanup_old_logs()
     call_session.preload_static_clips()
-    logger.info(
-        "[CONFIG] AUDIO_PRIMING_MS=%d PRIMING_IDLE_THRESHOLD_MS=%d",
-        config.AUDIO_PRIMING_MS, config.PRIMING_IDLE_THRESHOLD_MS,
-    )
-    await asyncio.to_thread(_measure_rtt_avg, OPENAI_RTT_HOST, OPENAI_RTT_PORT)
     yield
 
 

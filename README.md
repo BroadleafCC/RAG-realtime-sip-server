@@ -70,13 +70,8 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
 
 - `VAD_SPEECH_END_MS`（既定500ms）: 発話終了とみなすまでの無音継続時間。短くする
   ほど応答は速くなるが、語尾の「間」を誤って区切るリスクが上がる。
-- `AUDIO_PRIMING_MS`（既定250ms、旧名`RESPONSE_LEAD_SILENCE_MS`）: 各応答の音声
-  冒頭に挿入する無音（プライミング）の長さ。出力ストリームが立ち上がる瞬間の
-  頭切れ対策。0で無効化可能。頭切れ検証中は段階的に下げて`[HEAD-CLIP?]`ログが
-  出ないことを確認すること（出たら1段階戻す）。
-- `PRIMING_IDLE_THRESHOLD_MS`（既定1000ms）: 直前のTwilio送信からこの時間以内に
-  始まる本応答はプライミングを省略する（`ENABLE_FILLER=true`で相槌がストリームを
-  温めている場合等）。
+- `RESPONSE_LEAD_SILENCE_MS`（既定250ms）: 各応答の音声冒頭に挿入する無音の長さ。
+  出力ストリームが立ち上がる瞬間の頭切れ対策。
 - `ENABLE_FILLER` / `FILLER_AUDIO_PATH`: trueにすると、発話終了直後（応答生成の
   待ち時間）に短い相槌音声を即時再生し、無音区間を埋める（オプション機能。
   デフォルトはfalse）。フレーズや声を変えたい場合は
