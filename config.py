@@ -59,9 +59,25 @@ MAX_CALL_DURATION_SEC = _int("MAX_CALL_DURATION_SEC", 300)
 RESPONSE_WATCHDOG_FIRST_SEC = _int("RESPONSE_WATCHDOG_FIRST_SEC", 5)
 RESPONSE_WATCHDOG_SECOND_SEC = _int("RESPONSE_WATCHDOG_SECOND_SEC", 5)
 
-# 応答冒頭の頭切れ対策（改善指示書 2-b）: 各応答の最初の音声フレームを送る前に
-# 挿入する無音(μ-law 0xFF)の長さ。出力ストリームが立ち上がる間の頭切れを吸収する。
-RESPONSE_LEAD_SILENCE_MS = _int("RESPONSE_LEAD_SILENCE_MS", 250)
+# 応答冒頭の頭切れ対策（改善指示書 2-b、レイテンシ回収指示書 修正1で
+# AUDIO_PRIMING_MSに改称）: 各応答の最初の音声フレームを送る前に挿入する
+# 無音(μ-law 0xFF)の長さ。出力ストリームが立ち上がる間の頭切れを吸収する
+# ための「無音プライミング」。0を指定すると完全に無効化される
+# （twilio_client.send_lead_silenceがduration_ms<=0で即returnするため）。
+# これは検証中の仮説（20msフレーム整形の方が真の効き手ではないか）であり、
+# 頭切れが再発したら値を戻すこと。旧環境変数名RESPONSE_LEAD_SILENCE_MSは
+# 後方互換のため引き続き読む（Railway側の設定変更漏れ対策）。
+if "AUDIO_PRIMING_MS" in os.environ:
+    AUDIO_PRIMING_MS = int(os.environ["AUDIO_PRIMING_MS"])
+elif "RESPONSE_LEAD_SILENCE_MS" in os.environ:
+    AUDIO_PRIMING_MS = int(os.environ["RESPONSE_LEAD_SILENCE_MS"])
+else:
+    AUDIO_PRIMING_MS = 250
+
+# 相槌併用時のプライミング省略（レイテンシ回収指示書 修正2）: 直前に
+# Twilioへ音声フレームを送信してからこの秒数以内に本応答が始まる場合、
+# 出力ストリームは既に温まっているとみなしプライミングを省略する。
+PRIMING_IDLE_THRESHOLD_MS = _int("PRIMING_IDLE_THRESHOLD_MS", 1000)
 
 # 即時相槌（改善指示書 1-b、オプション機能）。true にすると commit +
 # response.create 直後に事前録音の短い相槌音声を即座に再生し、モデルの

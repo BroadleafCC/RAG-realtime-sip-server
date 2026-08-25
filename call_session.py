@@ -206,6 +206,25 @@ class CallSession:
         self.response_deadline: float | None = None
         self.response_watchdog_stage = 0
 
+        # 相槌併用時のプライミング省略（改善指示書「レイテンシ回収」修正2）用。
+        # Twilioへ音声フレームを送信するたび更新し、次の本応答の頭切れ対策
+        # (プライミング)を送るかどうかの判定に使う（pump_openai_to_twilio参照）。
+        self.last_frame_sent_at: float | None = None
+
+        # ターンごとのレイテンシ内訳計測（改善指示書「レイテンシ回収」修正3-a）用。
+        # VADの発話終了検知(_handle_vad_event)からcommit送信までを
+        # _turn_eos_at/_turn_commit_atに、response.created受信を
+        # _turn_response_created_atに、最初のdelta受信を_turn_first_delta_atに
+        # 記録し、最初のフレーム送信時点で[LATENCY]として1行にまとめてログ出力
+        # する（_log_turn_latency）。ログ後はeos/commitをNoneに戻し、function
+        # callingの追加応答等（新たなVAD発話終了を伴わない応答）で古い値と
+        # 誤って組み合わせてログしないようにする。
+        self._turn_eos_at: float | None = None
+        self._turn_commit_at: float | None = None
+        self._turn_response_created_at: float | None = None
+        self._turn_first_delta_at: float | None = None
+        self._turn_latency_logged = False
+
 
 async def run(twilio_ws):
     session = CallSession()
@@ -395,6 +414,40 @@ def _log_audio_stats(session: CallSession, mark_name: str) -> None:
     )
 
 
+def _log_turn_latency(session: CallSession) -> None:
+    """ターンごとのレイテンシ内訳を1行にまとめてログ出力する（改善指示書
+    「レイテンシ回収」修正3-a）。リージョン移設の効果を体感でなく数字で
+    比較するための計測基盤であり、4区間のうちcommit_to_response_createdが
+    ネットワーク距離の影響を最も直接受ける。
+
+    いずれかの時刻が欠けている場合（挨拶・FAX案内・function calling後の
+    追加応答など、VADの発話終了を経ない応答）はログを出さない。ログ後は
+    eos_at/commit_atをNoneに戻し、次に新たなVAD発話終了イベントが来るまで
+    古い値を使い回さないようにする。
+    """
+    eos = session._turn_eos_at
+    commit = session._turn_commit_at
+    created = session._turn_response_created_at
+    first_delta = session._turn_first_delta_at
+    first_frame = session._audio_stats.first_frame_sent_at
+    if None in (eos, commit, created, first_delta, first_frame):
+        return
+    eos_to_commit = (commit - eos) * 1000
+    commit_to_created = (created - commit) * 1000
+    created_to_first_delta = (first_delta - created) * 1000
+    first_delta_to_first_frame = (first_frame - first_delta) * 1000
+    total = (first_frame - eos) * 1000
+    logger.info(
+        "[LATENCY] eos_to_commit=%.0fms commit_to_response_created=%.0fms "
+        "created_to_first_delta=%.0fms first_delta_to_first_frame_sent=%.0fms "
+        "total_eos_to_frame=%.0fms",
+        eos_to_commit, commit_to_created, created_to_first_delta,
+        first_delta_to_first_frame, total,
+    )
+    session._turn_eos_at = None
+    session._turn_commit_at = None
+
+
 def _refresh_silence_eligibility(session: CallSession, reason: str | None = None) -> None:
     """無音タイマーの起点(silence_anchor)を一元管理する。
 
@@ -421,6 +474,7 @@ async def _handle_vad_event(session: CallSession, twilio_ws, transition: VadTran
         _refresh_silence_eligibility(session, reason="speech")
 
     elif event == VadEvent.END_OF_SPEECH:
+        session._turn_eos_at = time.monotonic()
         if not session._openai_ready.is_set():
             # OpenAI接続がまだ準備できていない（改善指示書「挨拶即時再生」
             # 3章）。接続完了後、openai_connection_taskがキューflush直後に
@@ -429,6 +483,7 @@ async def _handle_vad_event(session: CallSession, twilio_ws, transition: VadTran
             logger.info("[QUEUE] 発話終了を検知しましたが接続待ちのためcommitを保留します")
         else:
             await session.openai.commit()
+            session._turn_commit_at = time.monotonic()
             await session.openai.response_create()
             session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
             session.response_watchdog_stage = 0
@@ -513,6 +568,7 @@ async def _play_filler(session: CallSession, twilio_ws) -> None:
         if len(chunk) < twilio_client.FRAME_BYTES:
             chunk = chunk + twilio_client.SILENCE_BYTE * (twilio_client.FRAME_BYTES - len(chunk))
         await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, chunk)
+    session.last_frame_sent_at = time.monotonic()
     logger.info("[FILLER] 相槌音声を再生しました bytes=%d", len(data))
 
 
@@ -525,12 +581,14 @@ async def _play_clip_with_mark(session: CallSession, twilio_ws, path: str, mark_
     if not data:
         return
     session.ai_is_speaking = True
-    await twilio_client.send_lead_silence(twilio_ws, session.stream_sid, config.RESPONSE_LEAD_SILENCE_MS)
+    await twilio_client.send_lead_silence(twilio_ws, session.stream_sid, config.AUDIO_PRIMING_MS)
+    session.last_frame_sent_at = time.monotonic()
     for i in range(0, len(data), twilio_client.FRAME_BYTES):
         chunk = data[i:i + twilio_client.FRAME_BYTES]
         if len(chunk) < twilio_client.FRAME_BYTES:
             chunk = chunk + twilio_client.SILENCE_BYTE * (twilio_client.FRAME_BYTES - len(chunk))
         await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, chunk)
+    session.last_frame_sent_at = time.monotonic()
     session._mark_seq += 1
     mark_name = f"{mark_prefix}_{session._mark_seq}"
     session._pending_mark_name = mark_name
@@ -631,7 +689,10 @@ async def _connect_openai_for_call(call_sid: str) -> tuple[OpenAiRealtimeSocket,
     await socket.send_session_update(instructions)
     await _wait_for_session_updated(socket)
     await socket.inject_greeting_said()
-    logger.info("[OA-CONNECT] session確立 call_sid=%s", call_sid)
+    logger.info(
+        "[OA-CONNECT] session確立 call_sid=%s audio_priming_ms=%d priming_idle_threshold_ms=%d",
+        call_sid, config.AUDIO_PRIMING_MS, config.PRIMING_IDLE_THRESHOLD_MS,
+    )
     return socket, time.monotonic()
 
 
@@ -693,6 +754,7 @@ async def openai_connection_task(session: CallSession, twilio_ws, start_received
         session._deferred_end_of_speech = False
         logger.info("[QUEUE] 保留していた発話終了検知でcommitを送信します call_sid=%s", session.call_sid)
         await session.openai.commit()
+        session._turn_commit_at = time.monotonic()
         await session.openai.response_create()
         session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
         session.response_watchdog_stage = 0
@@ -748,6 +810,13 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
             session._audio_stats = _AudioStats(resp_id=session._response_id)
             session._current_item_id = None
             session._current_response_done = False
+            # ターンレイテンシ計測（改善指示書「レイテンシ回収」修正3-a）。
+            # eos_at/commit_atは新たなVAD発話終了イベントでのみ更新される
+            # （_log_turn_latencyでNoneに戻すため、function calling等の
+            # 追加応答ではNoneのまま=計測対象外になる）。
+            session._turn_response_created_at = time.monotonic()
+            session._turn_first_delta_at = None
+            session._turn_latency_logged = False
 
         elif event_type == "response.output_item.added":
             # バージイン時のconversation.item.truncateに必要なitem_idを取得する
@@ -787,6 +856,7 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
                 stats.bytes_in += len(raw)
                 if stats.first_delta_bytes is None:
                     stats.first_delta_bytes = len(raw)
+                    session._turn_first_delta_at = time.monotonic()
 
                 if not session._lead_silence_sent:
                     # この応答で最初の音声が来た瞬間、実フレームの前に無音を
@@ -795,9 +865,26 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
                     # 「バージイン実装」で判明: output_audio_buffer.startedに
                     # だけ頼るとバージイン判定が効かない実測があったため、
                     # 実際に音声送信を開始した事実そのものをトリガーにする）。
-                    await twilio_client.send_lead_silence(
-                        twilio_ws, session.stream_sid, config.RESPONSE_LEAD_SILENCE_MS
+                    #
+                    # 相槌併用時のプライミング省略（改善指示書「レイテンシ回収」
+                    # 修正2）: 直前のTwilio送信からPRIMING_IDLE_THRESHOLD_MS以内
+                    # なら出力ストリームは既に温まっているとみなし省略する。
+                    # アイドル状態（挨拶直後・長い沈黙後）はlast_frame_sent_at
+                    # がNoneまたは古いため、通常どおりプライミングされる。
+                    idle_ms = (
+                        (time.monotonic() - session.last_frame_sent_at) * 1000
+                        if session.last_frame_sent_at is not None else None
                     )
+                    if idle_ms is not None and idle_ms <= config.PRIMING_IDLE_THRESHOLD_MS:
+                        logger.info(
+                            "[PRIMING] 省略 idle_ms=%.0f (閾値%dms以内のためストリームは温まっている)",
+                            idle_ms, config.PRIMING_IDLE_THRESHOLD_MS,
+                        )
+                    else:
+                        await twilio_client.send_lead_silence(
+                            twilio_ws, session.stream_sid, config.AUDIO_PRIMING_MS
+                        )
+                        session.last_frame_sent_at = time.monotonic()
                     session._lead_silence_sent = True
                     session.ai_is_speaking = True
                     _refresh_silence_eligibility(session)
@@ -809,6 +896,10 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
                         stats.first_frame_sent_at = time.monotonic()
                     stats.bytes_out += len(frame)
                     await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, frame)
+                    session.last_frame_sent_at = time.monotonic()
+                if not session._turn_latency_logged and stats.first_frame_sent_at is not None:
+                    _log_turn_latency(session)
+                    session._turn_latency_logged = True
 
         elif event_type == "response.output_audio.done":
             # フレーム整形バッファに残った端数（160byte未満）を無音パディング
@@ -822,6 +913,7 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
                     stats.first_frame_sent_at = time.monotonic()
                 stats.bytes_out += real_len
                 await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, tail_frame)
+                session.last_frame_sent_at = time.monotonic()
 
             # この応答の音声フレームはすべてTwilioへ送信済み。ただし
             # Twilioの電話口での再生はまだ完了していない可能性が高い
@@ -843,6 +935,11 @@ async def pump_openai_to_twilio(session: CallSession, twilio_ws):
             text = event.get("transcript", "")
             if text:
                 session.transcript_lines.append(f"AI: {text}")
+                # 頭切れ検証（改善指示書「レイテンシ回収」修正1）: モデルが
+                # 「言おうとした文」をここで確定ログする。通話後、実際に回線に
+                # 流れた音（Whisper文字起こし）と先頭20文字を突き合わせる
+                # （salesforce_case._check_head_clip参照）。
+                logger.info("[AI-TRANSCRIPT] resp_id=%s text=%s", session._response_id, text)
 
         elif event_type == "conversation.item.input_audio_transcription.completed":
             text = event.get("transcript", "")
