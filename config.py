@@ -41,6 +41,10 @@ SF_CASE_RECORD_TYPE_ID = os.getenv("SF_CASE_RECORD_TYPE_ID", "")
 GOOGLE_CHAT_WEBHOOK_URL = os.getenv("GOOGLE_CHAT_WEBHOOK_URL", "")
 RAILWAY_DASHBOARD_URL = os.getenv("RAILWAY_DASHBOARD_URL", "")
 
+# 管理ダッシュボード(/admin/dashboard)。移植元と同じく、未設定の場合は
+# プロンプト編集とコスト設定保存が誰にも通らない（画面と参照系は無認証）。
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+
 # ログDB（本番はRailwayボリューム、ローカル開発は環境変数で上書き）
 CALL_LOG_DB_PATH = os.getenv("CALL_LOG_DB_PATH", "/data/call_log.db")
 

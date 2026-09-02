@@ -8,6 +8,7 @@ from fastapi.responses import PlainTextResponse
 from itsdangerous import BadSignature, SignatureExpired
 from starlette.websockets import WebSocketDisconnect
 
+import admin
 import call_logger
 import call_session
 import config
@@ -34,6 +35,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(admin._UnauthorizedError)
+async def _admin_unauthorized(request: Request, exc: admin._UnauthorizedError):
+    """移植元Flaskの before_request が返していた 401 を再現する。"""
+    return PlainTextResponse("Authentication required", status_code=401)
+
+
+# 管理ダッシュボード(/admin/*)。移植元と同じくアプリ本体と同居させる
+# （ログDBが同一プロセスから見えるSQLiteファイルのため別サービスにできない）。
+app.include_router(admin.router)
 
 
 @app.get("/health")
