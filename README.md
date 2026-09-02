@@ -68,6 +68,12 @@ Voice webhookに `https://xxxx.ngrok-free.app/voice` として設定する。
 
 ## 応答速度・音声頭切れチューニング
 
+- `OPENAI_REALTIME_MODEL`（既定`gpt-realtime-2.1-mini`）: Realtime 2.1系はp95レイテンシ
+  が約25%改善し、英数字認識・無音/ノイズ処理・割り込み挙動も改善されている。miniで
+  FAX番号案内（`play_fax_number` のfunction calling）が発火しない事象が出た場合は、
+  Railwayの環境変数で `gpt-realtime-2.1`、さらに駄目なら `gpt-realtime-1.5` へ切り戻す。
+  なおコスト単価の既定値（`call_logger.COST_SETTINGS_DEFAULTS`）は旧モデル基準のままなので、
+  ダッシュボードのOpenAIコストは実額とズレる（既知・許容）。
 - `VAD_SPEECH_END_MS`（既定500ms）: 発話終了とみなすまでの無音継続時間。短くする
   ほど応答は速くなるが、語尾の「間」を誤って区切るリスクが上がる。
 - `RESPONSE_LEAD_SILENCE_MS`（既定250ms）: 各応答の音声冒頭に挿入する無音の長さ。

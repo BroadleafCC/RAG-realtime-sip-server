@@ -15,7 +15,15 @@ def _float(name: str, default: float) -> float:
 
 # OpenAI（この新規プロジェクト専用のキー。既存システムとは共有しない＝コスト分離）
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5")
+# 2026-07リリースの Realtime 2.1 系へ移行。p95レイテンシが約25%改善し、英数字認識・
+# 無音/ノイズ処理・割り込み挙動も改善されている（いずれも本システムの弱点そのもの）。
+# miniを既定にするのはコスト優先の運用判断。ただしminiは「function callingが発火
+# しなくなった」というコミュニティ報告があるため、FAX番号案内(play_fax_number)が
+# 動かない場合はRailwayの環境変数で gpt-realtime-2.1（非mini）へ、それでも駄目なら
+# gpt-realtime-1.5 へ即座に切り戻すこと。
+# 注意: Railway側に OPENAI_REALTIME_MODEL が明示設定されている場合、このデフォルトは
+# 使われない（環境変数の値が優先される）。
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1-mini")
 
 # Twilio
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
