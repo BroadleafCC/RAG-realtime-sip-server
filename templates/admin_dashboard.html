@@ -204,6 +204,7 @@
                                     <th class="text-end">Whisper</th>
                                     <th class="text-end">GPT-4o-mini</th>
                                     <th class="text-end">Twilio通話</th>
+                                    <th class="text-end">Twilioメディアストリーム</th>
                                     <th class="text-end">Twilio録音</th>
                                     <th class="text-end">固定費</th>
                                     <th class="text-end">合計（推定）</th>
@@ -226,6 +227,7 @@
                                     <th class="text-end">Whisper</th>
                                     <th class="text-end">GPT-4o-mini</th>
                                     <th class="text-end">Twilio通話</th>
+                                    <th class="text-end">Twilioメディアストリーム</th>
                                     <th class="text-end">Twilio録音</th>
                                     <th class="text-end">合計</th>
                                 </tr>
@@ -538,8 +540,10 @@
 
             // 今月のTwilioコスト
             const curTwilio = twilioMonthly.find(r => r.month === curMonth) ||
-                              { calls_usd: 0, recordings_usd: 0, calls_count: 0, calls_minutes: 0 };
-            const twilioTotal = (curTwilio.calls_usd || 0) + (curTwilio.recordings_usd || 0);
+                              { calls_usd: 0, recordings_usd: 0, calls_count: 0, calls_minutes: 0,
+                                media_stream_usd: 0, media_stream_minutes: 0 };
+            const twilioTotal = (curTwilio.calls_usd || 0) + (curTwilio.recordings_usd || 0)
+                              + (curTwilio.media_stream_usd || 0);
 
             const variableTotal = openaiTotal + twilioTotal;
             const fixedTotal = (fixed.total_usd || 0);
@@ -568,6 +572,7 @@
             // Twilio内訳
             document.getElementById('cost-twilio-breakdown').innerHTML = [
                 [`通話料 (${curTwilio.calls_count || 0}件 / ${(curTwilio.calls_minutes || 0).toFixed(1)}分)`, curTwilio.calls_usd || 0],
+                [`メディアストリーム料 (${(curTwilio.media_stream_minutes || 0).toFixed(1)}分)`, curTwilio.media_stream_usd || 0],
                 ['録音料', curTwilio.recordings_usd || 0],
                 ['Twilio 合計', twilioTotal],
             ].map(([label, usd], i, arr) => `
@@ -600,7 +605,7 @@
 
             if (sortedMonths.length === 0) {
                 document.getElementById('cost-history-table').innerHTML =
-                    '<tr><td colspan="8" class="text-center text-muted">データなし</td></tr>';
+                    '<tr><td colspan="9" class="text-center text-muted">データなし</td></tr>';
             } else {
                 document.getElementById('cost-history-table').innerHTML = sortedMonths.map(month => {
                     const oa = { realtime: 0, whisper: 0, gpt4omini: 0 };
@@ -609,14 +614,16 @@
                         if (r.service === 'openai_whisper') oa.whisper += r.cost_usd || 0;
                         if (r.service === 'openai_gpt4omini') oa.gpt4omini += r.cost_usd || 0;
                     });
-                    const tw = twilioMonthly.find(r => r.month === month) || { calls_usd: 0, recordings_usd: 0 };
-                    const total = oa.realtime + oa.whisper + oa.gpt4omini + (tw.calls_usd || 0) + (tw.recordings_usd || 0) + fixedTotal;
+                    const tw = twilioMonthly.find(r => r.month === month) || { calls_usd: 0, recordings_usd: 0, media_stream_usd: 0 };
+                    const total = oa.realtime + oa.whisper + oa.gpt4omini + (tw.calls_usd || 0)
+                                + (tw.media_stream_usd || 0) + (tw.recordings_usd || 0) + fixedTotal;
                     return `<tr${month === curMonth ? ' class="table-primary"' : ''}>
                         <td><strong>${month}</strong>${month === curMonth ? ' <span class="badge bg-primary">今月</span>' : ''}</td>
                         <td class="text-end">${fmtJpy(jpy(oa.realtime, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(oa.whisper, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(oa.gpt4omini, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(tw.calls_usd || 0, rate))}</td>
+                        <td class="text-end">${fmtJpy(jpy(tw.media_stream_usd || 0, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(tw.recordings_usd || 0, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(fixedTotal, rate))}</td>
                         <td class="text-end"><strong>${fmtJpy(jpy(total, rate))}</strong></td>
@@ -627,30 +634,32 @@
             // 日別内訳テーブル
             const dailyByDay = {};
             (openai.daily || []).forEach(r => {
-                if (!dailyByDay[r.day]) dailyByDay[r.day] = { realtime: 0, whisper: 0, gpt4omini: 0, tw_calls: 0, tw_rec: 0 };
+                if (!dailyByDay[r.day]) dailyByDay[r.day] = { realtime: 0, whisper: 0, gpt4omini: 0, tw_calls: 0, tw_ms: 0, tw_rec: 0 };
                 if (r.service === 'openai_realtime') dailyByDay[r.day].realtime += r.cost_usd || 0;
                 if (r.service === 'openai_whisper') dailyByDay[r.day].whisper += r.cost_usd || 0;
                 if (r.service === 'openai_gpt4omini') dailyByDay[r.day].gpt4omini += r.cost_usd || 0;
             });
             (data.twilio_daily || []).forEach(r => {
-                if (!dailyByDay[r.day]) dailyByDay[r.day] = { realtime: 0, whisper: 0, gpt4omini: 0, tw_calls: 0, tw_rec: 0 };
+                if (!dailyByDay[r.day]) dailyByDay[r.day] = { realtime: 0, whisper: 0, gpt4omini: 0, tw_calls: 0, tw_ms: 0, tw_rec: 0 };
                 dailyByDay[r.day].tw_calls += r.calls_usd || 0;
+                dailyByDay[r.day].tw_ms += r.media_stream_usd || 0;
                 dailyByDay[r.day].tw_rec += r.recordings_usd || 0;
             });
             const days = Object.keys(dailyByDay).sort().reverse();
             if (days.length === 0) {
                 document.getElementById('cost-daily-table').innerHTML =
-                    '<tr><td colspan="7" class="text-center text-muted">データなし（デプロイ後の通話から集計されます）</td></tr>';
+                    '<tr><td colspan="8" class="text-center text-muted">データなし（デプロイ後の通話から集計されます）</td></tr>';
             } else {
                 document.getElementById('cost-daily-table').innerHTML = days.map(day => {
                     const d = dailyByDay[day];
-                    const total = d.realtime + d.whisper + d.gpt4omini + d.tw_calls + d.tw_rec;
+                    const total = d.realtime + d.whisper + d.gpt4omini + d.tw_calls + d.tw_ms + d.tw_rec;
                     return `<tr>
                         <td>${day}</td>
                         <td class="text-end">${fmtJpy(jpy(d.realtime, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(d.whisper, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(d.gpt4omini, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(d.tw_calls, rate))}</td>
+                        <td class="text-end">${fmtJpy(jpy(d.tw_ms, rate))}</td>
                         <td class="text-end">${fmtJpy(jpy(d.tw_rec, rate))}</td>
                         <td class="text-end"><strong>${fmtJpy(jpy(total, rate))}</strong></td>
                     </tr>`;

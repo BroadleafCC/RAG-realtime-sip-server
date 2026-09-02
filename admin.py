@@ -213,7 +213,7 @@ def _fetch_twilio_monthly(jpy_rate: float):
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
         return []
     monthly = {}
-    for category in ['calls-inbound', 'calls-sip-inbound', 'recordings']:
+    for category in ['calls-inbound', 'calls-media-stream-minutes', 'recordings']:
         try:
             resp = http_requests.get(
                 f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Usage/Records/Monthly.json",
@@ -229,14 +229,23 @@ def _fetch_twilio_monthly(jpy_rate: float):
                     continue
                 if month not in monthly:
                     monthly[month] = {'month': month, 'calls_usd': 0.0, 'recordings_usd': 0.0,
-                                      'calls_count': 0, 'calls_minutes': 0.0}
+                                      'calls_count': 0, 'calls_minutes': 0.0,
+                                      'media_stream_usd': 0.0, 'media_stream_minutes': 0.0}
                 raw_price = abs(float(r.get('price') or '0'))
                 price_unit = (r.get('price_unit') or 'USD').upper()
                 # TwilioアカウントがJPY建ての場合はUSDに換算する
                 price_usd = raw_price / jpy_rate if price_unit == 'JPY' else raw_price
                 count = int(r.get('count') or '0')
                 usage = float(r.get('usage') or '0')
-                if 'calls' in category:
+                # media-stream はカテゴリ名に 'calls' を含むため先に判定する。
+                # Twilioの課金体系は calls = calls-inbound + calls-outbound +
+                # calls-media-stream-minutes で、通話料とは別枠の従量課金
+                # （実データで3期間とも一致を確認済み）。通話料に合算すると
+                # 件数・分数まで二重に積まれるため独立項目として集計する。
+                if category == 'calls-media-stream-minutes':
+                    monthly[month]['media_stream_usd'] += price_usd
+                    monthly[month]['media_stream_minutes'] += usage
+                elif 'calls' in category:
                     monthly[month]['calls_usd'] += price_usd
                     monthly[month]['calls_count'] += count
                     monthly[month]['calls_minutes'] += usage
@@ -255,7 +264,7 @@ def _fetch_twilio_daily(jpy_rate: float, current_month: str):
     start_date = current_month + '-01'
     end_date = datetime.now(jst).strftime('%Y-%m-%d')
     daily = {}
-    for category in ['calls-inbound', 'calls-sip-inbound', 'recordings']:
+    for category in ['calls-inbound', 'calls-media-stream-minutes', 'recordings']:
         try:
             resp = http_requests.get(
                 f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Usage/Records/Daily.json",
@@ -270,11 +279,14 @@ def _fetch_twilio_daily(jpy_rate: float, current_month: str):
                 if not day:
                     continue
                 if day not in daily:
-                    daily[day] = {'day': day, 'calls_usd': 0.0, 'recordings_usd': 0.0}
+                    daily[day] = {'day': day, 'calls_usd': 0.0, 'recordings_usd': 0.0,
+                                  'media_stream_usd': 0.0}
                 raw_price = abs(float(r.get('price') or '0'))
                 price_unit = (r.get('price_unit') or 'USD').upper()
                 price_usd = raw_price / jpy_rate if price_unit == 'JPY' else raw_price
-                if 'calls' in category:
+                if category == 'calls-media-stream-minutes':
+                    daily[day]['media_stream_usd'] += price_usd
+                elif 'calls' in category:
                     daily[day]['calls_usd'] += price_usd
                 else:
                     daily[day]['recordings_usd'] += price_usd
