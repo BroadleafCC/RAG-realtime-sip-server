@@ -104,6 +104,19 @@ ESCALATION_AUDIO_PATH = os.getenv("ESCALATION_AUDIO_PATH", "assets/audio/escalat
 # 再生する（call_session.py参照）。
 FAX_AUDIO_PATH = os.getenv("FAX_AUDIO_PATH", "assets/audio/fax_number.ulaw")
 
+# AgentSearch（Vertex AI Search / faq-search-app、Generative Answers有効）。
+# 認証はgoogle-authのADC(Application Default Credentials)に委ねるため、
+# サービスアカウントキーはコード側では読まない。Railwayでは環境変数
+# GOOGLE_APPLICATION_CREDENTIALS_JSON にキーJSONの中身をそのまま貼り、
+# 起動時にファイル化してGOOGLE_APPLICATION_CREDENTIALSへ渡す運用を想定
+# （Railwayにはローカルの秘密ファイルを直接置けないため）。
+AGENTSEARCH_PROJECT_ID = os.getenv("AGENTSEARCH_PROJECT_ID", "")
+AGENTSEARCH_LOCATION = os.getenv("AGENTSEARCH_LOCATION", "global")
+AGENTSEARCH_ENGINE_ID = os.getenv("AGENTSEARCH_ENGINE_ID", "")
+# 指示書(agentsearch-integration-phase1.md 4章)の「タイムアウト値は未定、
+# 仮に8秒」を踏襲。正式値はPhase 1完了後の検討課題。
+AGENTSEARCH_TIMEOUT_SEC = _float("AGENTSEARCH_TIMEOUT_SEC", 8.0)
+
 # 検証専用: 指定秒数経過後、受信mediaフレームを意図的に無視して途絶を再現する。
 # 0で無効（本番は必ず0）。
 DEBUG_DROP_MEDIA_AFTER_SEC = _float("DEBUG_DROP_MEDIA_AFTER_SEC", 0.0)
