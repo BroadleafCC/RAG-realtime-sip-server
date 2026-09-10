@@ -117,6 +117,11 @@ AGENTSEARCH_ENGINE_ID = os.getenv("AGENTSEARCH_ENGINE_ID", "")
 # 仮に8秒」を踏襲。正式値はPhase 1完了後の検討課題。
 AGENTSEARCH_TIMEOUT_SEC = _float("AGENTSEARCH_TIMEOUT_SEC", 8.0)
 
+# search_faq検索中に流す保留音楽（μ-law 8kHz生データ）。ファイルが無い場合は
+# 既存の_load_static_clipの仕様どおり再生をスキップし、無音のまま検索を待つ
+# だけになる（動作は変わらない）。
+HOLD_MUSIC_AUDIO_PATH = os.getenv("HOLD_MUSIC_AUDIO_PATH", "assets/audio/hold_music.ulaw")
+
 # 検証専用: 指定秒数経過後、受信mediaフレームを意図的に無視して途絶を再現する。
 # 0で無効（本番は必ず0）。
 DEBUG_DROP_MEDIA_AFTER_SEC = _float("DEBUG_DROP_MEDIA_AFTER_SEC", 0.0)

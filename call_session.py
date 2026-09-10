@@ -75,6 +75,7 @@ def preload_static_clips() -> None:
     _load_static_clip(config.SILENCE_GOODBYE_AUDIO_PATH)
     _load_static_clip(config.ESCALATION_AUDIO_PATH)
     _load_static_clip(config.FAX_AUDIO_PATH)
+    _load_static_clip(config.HOLD_MUSIC_AUDIO_PATH)
     if config.ENABLE_FILLER:
         _load_static_clip(config.FILLER_AUDIO_PATH)
 
@@ -539,6 +540,25 @@ async def _play_clip_with_mark(session: CallSession, twilio_ws, path: str, mark_
     await twilio_client.send_mark(twilio_ws, session.stream_sid, mark_name)
 
 
+async def _play_hold_music(session: CallSession, twilio_ws) -> None:
+    """search_faq検索中、結果が届くまでループ再生する保留音楽。
+    _handle_function_callがsearch_faqの待機と並行してasyncio.create_taskで
+    起動し、検索完了時にキャンセルする想定。クリップ末尾まで送り切ったら
+    先頭に戻って送り続けるだけで、キャンセルされたタイミングでそのまま
+    停止する（Twilio側に残った分はcancel後のsend_clearで即座に破棄する。
+    _handle_function_call参照）。"""
+    data = _load_static_clip(config.HOLD_MUSIC_AUDIO_PATH)
+    if not data:
+        return
+    session.ai_is_speaking = True
+    while True:
+        for i in range(0, len(data), twilio_client.FRAME_BYTES):
+            chunk = data[i:i + twilio_client.FRAME_BYTES]
+            if len(chunk) < twilio_client.FRAME_BYTES:
+                chunk = chunk + twilio_client.SILENCE_BYTE * (twilio_client.FRAME_BYTES - len(chunk))
+            await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, chunk)
+
+
 async def _handle_function_call(session: CallSession, twilio_ws, item: dict) -> None:
     """response.output_item.doneでfunction_call型のitemを受けたときの処理。
     FAX番号案内はモデルに読み上げさせず事前録音クリップを再生する（速度を
@@ -573,7 +593,20 @@ async def _handle_function_call(session: CallSession, twilio_ws, item: dict) -> 
         # エラーになる（実機ログで確認済み）。検索開始時点で締切を検索の
         # 最大所要時間ぶん延長し、誤発火を防ぐ。
         session.response_deadline = time.monotonic() + config.AGENTSEARCH_TIMEOUT_SEC
-        output = await agent_search.search_faq(args.get("query", ""))
+        hold_music_task = asyncio.create_task(_play_hold_music(session, twilio_ws))
+        try:
+            output = await agent_search.search_faq(args.get("query", ""))
+        finally:
+            hold_music_task.cancel()
+            try:
+                await hold_music_task
+            except asyncio.CancelledError:
+                pass
+            # ループ再生はキャンセル時点までの分がTwilio側バッファに残りうる
+            # ため、send_clearで即座に破棄してから本来の応答へ続ける
+            # （バージイン時のclear処理と同じ考え方）。
+            await twilio_client.send_clear(twilio_ws, session.stream_sid)
+            session.ai_is_speaking = False
     else:
         logger.warning("[TOOL] 未知の関数呼び出し name=%s call_id=%s", name, call_id)
         output = "{}"
