@@ -565,6 +565,14 @@ async def _handle_function_call(session: CallSession, twilio_ws, item: dict) -> 
             args = json.loads(item.get("arguments") or "{}")
         except (TypeError, ValueError):
             args = {}
+        # AgentSearch検索はAGENTSEARCH_TIMEOUT_SEC(既定8秒)かかりうる。応答
+        # ウォッチドッグ（5秒無応答でresponse.createを再送する仕組み。
+        # watchdogs.pyのresponse_watchdog参照）が検索中に誤発火すると、
+        # 検索結果が届く前にモデルが空の応答を生成してしまい、
+        # response.create()の二重送信で「conversation_already_has_active_response」
+        # エラーになる（実機ログで確認済み）。検索開始時点で締切を検索の
+        # 最大所要時間ぶん延長し、誤発火を防ぐ。
+        session.response_deadline = time.monotonic() + config.AGENTSEARCH_TIMEOUT_SEC
         output = await agent_search.search_faq(args.get("query", ""))
     else:
         logger.warning("[TOOL] 未知の関数呼び出し name=%s call_id=%s", name, call_id)
