@@ -19,6 +19,7 @@ import logging
 import websockets
 
 import config
+from agent_search import SEARCH_FAQ_TOOL
 
 logger = logging.getLogger("openai_client")
 
@@ -60,7 +61,7 @@ def build_session_update(instructions: str) -> dict:
         "session": {
             "type": "realtime",
             "instructions": instructions,
-            "tools": [FAX_NUMBER_TOOL],
+            "tools": [FAX_NUMBER_TOOL, SEARCH_FAQ_TOOL],
             "tool_choice": "auto",
             "audio": {
                 "input": {

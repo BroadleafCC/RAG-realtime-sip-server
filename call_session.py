@@ -20,11 +20,13 @@ from datetime import datetime, timezone
 
 from starlette.websockets import WebSocketDisconnect
 
+import agent_search
 import call_logger
 import config
 import salesforce_case
 import twilio_client
 import watchdogs
+from agent_search import SEARCH_FAQ_TOOL
 from audio_convert import ulaw_to_pcm16
 from openai_client import FAX_NUMBER_TOOL, GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
 from vad import TurnDetector, VadEvent, VadState, VadTransition
@@ -558,6 +560,12 @@ async def _handle_function_call(session: CallSession, twilio_ws, item: dict) -> 
             {"number": FAX_NUMBER_DISPLAY, "spoken_text": FAX_SPOKEN_TEXT},
             ensure_ascii=False,
         )
+    elif name == SEARCH_FAQ_TOOL["name"]:
+        try:
+            args = json.loads(item.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            args = {}
+        output = await agent_search.search_faq(args.get("query", ""))
     else:
         logger.warning("[TOOL] 未知の関数呼び出し name=%s call_id=%s", name, call_id)
         output = "{}"
