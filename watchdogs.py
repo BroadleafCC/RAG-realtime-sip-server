@@ -16,6 +16,7 @@ media_starvation_watchdog を互いに状態を参照しない独立した async
 ないクリップ方式へ統一した。
 """
 import asyncio
+import json
 import logging
 import time
 from datetime import timedelta
@@ -124,11 +125,34 @@ async def response_watchdog(session):
             continue
 
         if session.response_watchdog_stage == 0:
-            logger.warning("[WATCHDOG] 5秒応答なし。response.createを再送します")
+            # 未送信のfunction_call_outputが残ったままresponse.createだけを
+            # 再送しても、モデルはtool呼び出しの結果を持っていないため正しく
+            # 回復できない（claude_code_instructions_rag_hold_and_timeout.md
+            # 2-3-5）。先にフォールバック文言でtool呼び出しを解決してから
+            # response.createを送る。call_session._handle_function_call側は
+            # pending_tool_call_idが自分のcall_idと一致しなくなっていたら
+            # （＝ここで解決済み）二重送信しないようスキップする。
+            if session.pending_tool_call_id is not None:
+                logger.warning(
+                    "[WATCHDOG] 5秒応答なし。未送信のtool call(call_id=%s)にフォールバック応答を送ってからresponse.createを再送します",
+                    session.pending_tool_call_id,
+                )
+                try:
+                    await session.openai.send_function_call_output(
+                        session.pending_tool_call_id,
+                        json.dumps({"error": "処理に時間がかかっているため一旦応答します"}, ensure_ascii=False),
+                    )
+                    logger.info("[TOOLRESULT] call_id=%s output_submitted (by watchdog)", session.pending_tool_call_id)
+                except Exception as e:
+                    logger.warning("[WATCHDOG] フォールバックのtool出力送信に失敗: %s", e)
+                session.pending_tool_call_id = None
+            else:
+                logger.warning("[WATCHDOG] 5秒応答なし。response.createを再送します")
             session.response_watchdog_stage = 1
             session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_SECOND_SEC
             try:
                 await session.openai.response_create()
+                logger.info("[TOOLRESULT] response.create sent (by watchdog)")
             except Exception as e:
                 logger.warning("[WATCHDOG] response.create再送に失敗: %s", e)
             continue

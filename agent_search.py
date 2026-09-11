@@ -132,6 +132,7 @@ def _search_faq_sync(query: str) -> str:
     }
 
     started = time.monotonic()
+    logger.info("[AGENTSEARCH] query=%r 呼び出し開始 timeout_sec=%s", query, config.AGENTSEARCH_TIMEOUT_SEC)
     try:
         resp = requests.post(
             url,

@@ -18,6 +18,11 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+try:
+    import audioop
+except ModuleNotFoundError:  # Python 3.13+ では stdlib から削除された
+    import audioop_lts as audioop
+
 from starlette.websockets import WebSocketDisconnect
 
 import agent_search
@@ -208,6 +213,15 @@ class CallSession:
         self._silence_eligible = False
         self.response_deadline: float | None = None
         self.response_watchdog_stage = 0
+
+        # 未送信のtool call追跡用（RAGホールド/タイムアウト不具合対応）。
+        # _handle_function_callが呼び出しを受理した時点でcall_idを立て、
+        # function_call_output送信が完了したらNoneへ戻す。応答ウォッチドッグ
+        # （watchdogs.response_watchdog）はこれが立ったまま無応答タイムアウト
+        # した場合、response.create再送の前にフォールバックのtool出力を
+        # 送ることで「未送信のfunction_call_outputを残したままresponse.create
+        # だけ再送してもモデルが回復できない」問題を防ぐ。
+        self.pending_tool_call_id: str | None = None
 
 
 async def run(twilio_ws):
@@ -540,23 +554,63 @@ async def _play_clip_with_mark(session: CallSession, twilio_ws, path: str, mark_
     await twilio_client.send_mark(twilio_ws, session.stream_sid, mark_name)
 
 
+# フェードアウトにかけるフレーム数（1フレーム20ms×8 = 160ms）。
+_HOLD_MUSIC_FADE_FRAMES = 8
+
+
 async def _play_hold_music(session: CallSession, twilio_ws) -> None:
     """search_faq検索中、結果が届くまでループ再生する保留音楽。
     _handle_function_callがsearch_faqの待機と並行してasyncio.create_taskで
     起動し、検索完了時にキャンセルする想定。クリップ末尾まで送り切ったら
-    先頭に戻って送り続けるだけで、キャンセルされたタイミングでそのまま
-    停止する（Twilio側に残った分はcancel後のsend_clearで即座に破棄する。
-    _handle_function_call参照）。"""
+    先頭に戻って送り続ける。
+
+    重要: 1フレーム(20ms)ごとにasyncio.sleepで実時間ペースを守って送信する。
+    以前はクリップ全体（約51秒/2500フレーム超）を無ペースで一気に送っており、
+    RAG検索テスト通話で「検索は成功しているのに応答が返らないまま通話が
+    フリーズする」障害の原因になった（claude_code_instructions_rag_hold_
+    and_timeout.md 2章）。Twilio Media Streamsは送信側が実時間ペースで
+    フレームを送ることを前提としており、無ペースで大量送信するとTwilio側の
+    処理と受信ループの双方を巻き込んで通話全体が止まりうる。キャンセルは
+    次のフレーム送信/sleepの境界（最大20ms）で確実に効くようになる。"""
     data = _load_static_clip(config.HOLD_MUSIC_AUDIO_PATH)
     if not data:
         return
+    frame_bytes = twilio_client.FRAME_BYTES
+    frame_sec = frame_bytes / 8000.0
     session.ai_is_speaking = True
-    while True:
-        for i in range(0, len(data), twilio_client.FRAME_BYTES):
-            chunk = data[i:i + twilio_client.FRAME_BYTES]
-            if len(chunk) < twilio_client.FRAME_BYTES:
-                chunk = chunk + twilio_client.SILENCE_BYTE * (twilio_client.FRAME_BYTES - len(chunk))
+    logger.info("[HOLD] start")
+    pos = 0
+    try:
+        while True:
+            chunk = data[pos:pos + frame_bytes]
+            if len(chunk) < frame_bytes:
+                chunk = chunk + twilio_client.SILENCE_BYTE * (frame_bytes - len(chunk))
             await twilio_client.send_media_bytes(twilio_ws, session.stream_sid, chunk)
+            await asyncio.sleep(frame_sec)
+            pos += frame_bytes
+            if pos >= len(data):
+                pos = 0
+    except asyncio.CancelledError:
+        await _fade_out_hold_music(twilio_ws, session.stream_sid, data, pos, frame_bytes, frame_sec)
+        raise
+
+
+async def _fade_out_hold_music(
+    twilio_ws, stream_sid: str, data: bytes, pos: int, frame_bytes: int, frame_sec: float,
+) -> None:
+    """保留音楽の停止時、無音へ短くフェードアウトしてから止める（指示書1-3-2）。
+    キャンセルされた位置から続きのフレームを、音量を徐々に下げながら送る。
+    呼び出し側（_handle_function_call）はこの後さらにsend_clearでTwilio側の
+    再生キューを破棄するため、ここでの送信量はごく短時間（160ms）でよい。"""
+    for step in range(_HOLD_MUSIC_FADE_FRAMES):
+        chunk = data[pos:pos + frame_bytes]
+        if len(chunk) < frame_bytes:
+            chunk = chunk + data[:frame_bytes - len(chunk)]
+        factor = 1.0 - (step + 1) / _HOLD_MUSIC_FADE_FRAMES
+        pcm16 = audioop.mul(audioop.ulaw2lin(chunk, 2), 2, factor)
+        await twilio_client.send_media_bytes(twilio_ws, stream_sid, audioop.lin2ulaw(pcm16, 2))
+        await asyncio.sleep(frame_sec)
+        pos = (pos + frame_bytes) % len(data)
 
 
 async def _handle_function_call(session: CallSession, twilio_ws, item: dict) -> None:
@@ -574,45 +628,93 @@ async def _handle_function_call(session: CallSession, twilio_ws, item: dict) -> 
     if not call_id or session.openai is None:
         return
 
-    if name == FAX_NUMBER_TOOL["name"]:
-        await _play_clip_with_mark(session, twilio_ws, config.FAX_AUDIO_PATH, mark_prefix="fax")
-        output = json.dumps(
-            {"number": FAX_NUMBER_DISPLAY, "spoken_text": FAX_SPOKEN_TEXT},
-            ensure_ascii=False,
-        )
-    elif name == SEARCH_FAQ_TOOL["name"]:
-        try:
-            args = json.loads(item.get("arguments") or "{}")
-        except (TypeError, ValueError):
-            args = {}
-        # AgentSearch検索はAGENTSEARCH_TIMEOUT_SEC(既定8秒)かかりうる。応答
-        # ウォッチドッグ（5秒無応答でresponse.createを再送する仕組み。
-        # watchdogs.pyのresponse_watchdog参照）が検索中に誤発火すると、
-        # 検索結果が届く前にモデルが空の応答を生成してしまい、
-        # response.create()の二重送信で「conversation_already_has_active_response」
-        # エラーになる（実機ログで確認済み）。検索開始時点で締切を検索の
-        # 最大所要時間ぶん延長し、誤発火を防ぐ。
-        session.response_deadline = time.monotonic() + config.AGENTSEARCH_TIMEOUT_SEC
-        hold_music_task = asyncio.create_task(_play_hold_music(session, twilio_ws))
-        try:
-            output = await agent_search.search_faq(args.get("query", ""))
-        finally:
-            hold_music_task.cancel()
+    # 未送信tool call追跡（watchdogs.response_watchdog参照）。この関数の
+    # どの経路を通っても、最終的にfunction_call_output送信が完了するまでは
+    # 立てておく。
+    session.pending_tool_call_id = call_id
+    try:
+        if name == FAX_NUMBER_TOOL["name"]:
+            await _play_clip_with_mark(session, twilio_ws, config.FAX_AUDIO_PATH, mark_prefix="fax")
+            output = json.dumps(
+                {"number": FAX_NUMBER_DISPLAY, "spoken_text": FAX_SPOKEN_TEXT},
+                ensure_ascii=False,
+            )
+        elif name == SEARCH_FAQ_TOOL["name"]:
             try:
-                await hold_music_task
-            except asyncio.CancelledError:
-                pass
-            # ループ再生はキャンセル時点までの分がTwilio側バッファに残りうる
-            # ため、send_clearで即座に破棄してから本来の応答へ続ける
-            # （バージイン時のclear処理と同じ考え方）。
-            await twilio_client.send_clear(twilio_ws, session.stream_sid)
-            session.ai_is_speaking = False
-    else:
-        logger.warning("[TOOL] 未知の関数呼び出し name=%s call_id=%s", name, call_id)
-        output = "{}"
+                args = json.loads(item.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                args = {}
+            # AgentSearch検索はAGENTSEARCH_TIMEOUT_SEC(既定8秒)かかりうる。応答
+            # ウォッチドッグ（5秒無応答でresponse.createを再送する仕組み。
+            # watchdogs.pyのresponse_watchdog参照）が検索中に誤発火すると、
+            # 検索結果が届く前にモデルが空の応答を生成してしまい、
+            # response.create()の二重送信で「conversation_already_has_active_response」
+            # エラーになる（実機ログで確認済み）。検索開始時点で締切を検索の
+            # 最大所要時間+αぶん延長し、誤発火を防ぐ（+2秒はagent_search内部の
+            # HTTPタイムアウトとの競合を避けるための猶予）。
+            session.response_deadline = (
+                time.monotonic() + config.AGENTSEARCH_TIMEOUT_SEC + 2.0
+            )
+            hold_music_task = asyncio.create_task(_play_hold_music(session, twilio_ws))
+            try:
+                output = await agent_search.search_faq(args.get("query", ""))
+            except Exception as e:
+                # agent_search.search_faqは内部でAgentSearchErrorを捕捉して
+                # {"error": ...}を返す設計だが、想定外の例外（実装バグ等）で
+                # ここに抜けてきた場合でも、必ずfunction_call_outputを送れる
+                # ようフォールバック文言で吸収する（指示書2-3-2）。
+                logger.error("[TOOL] search_faqで予期しない例外: %s", e)
+                output = json.dumps(
+                    {"error": "検索処理で予期しないエラーが発生しました"}, ensure_ascii=False,
+                )
+            finally:
+                logger.info("[HOLD] stop reason=search_resolved")
+                hold_music_task.cancel()
+                try:
+                    await hold_music_task
+                except asyncio.CancelledError:
+                    pass
+                # フェードアウト済みの残りやTwilio側バッファに残った分を
+                # send_clearで即座に破棄してから本来の応答へ続ける
+                # （バージイン時のclear処理と同じ考え方）。
+                await twilio_client.send_clear(twilio_ws, session.stream_sid)
+                session.ai_is_speaking = False
+        else:
+            logger.warning("[TOOL] 未知の関数呼び出し name=%s call_id=%s", name, call_id)
+            output = "{}"
 
-    await session.openai.send_function_call_output(call_id, output)
-    await session.openai.response_create()
+        # 応答ウォッチドッグが既にこのcall_idをフォールバック解決済みの場合
+        # （5秒無応答→タイムアウト経路。watchdogs.response_watchdog参照）、
+        # ここで重ねてfunction_call_output/response.createを送ると
+        # 「conversation_already_has_active_response」等のエラーになりうる
+        # ため送らない。
+        if session.pending_tool_call_id == call_id:
+            await session.openai.send_function_call_output(call_id, output)
+            logger.info("[TOOLRESULT] call_id=%s output_submitted", call_id)
+            await session.openai.response_create()
+            logger.info("[TOOLRESULT] response.create sent call_id=%s", call_id)
+        else:
+            logger.info(
+                "[TOOLRESULT] call_id=%s は応答ウォッチドッグにより解決済みのため送信をスキップします",
+                call_id,
+            )
+    except Exception as e:
+        # ここに到達するのは送信自体（send_function_call_output/response_create）
+        # が例外を送出した場合等の最終防衛ライン。フォールバック文言で
+        # もう一度だけ送信を試みる（指示書2-3-2「try/finallyで保証」）。
+        logger.error("[TOOL] 関数呼び出し処理で予期しないエラー call_id=%s: %s", call_id, e)
+        try:
+            await session.openai.send_function_call_output(
+                call_id,
+                json.dumps({"error": "内部エラーが発生しました"}, ensure_ascii=False),
+            )
+            await session.openai.response_create()
+            logger.info("[TOOLRESULT] フォールバック応答を送信しました call_id=%s", call_id)
+        except Exception as e2:
+            logger.error("[TOOL] フォールバック応答の送信にも失敗しました call_id=%s: %s", call_id, e2)
+    finally:
+        if session.pending_tool_call_id == call_id:
+            session.pending_tool_call_id = None
 
 
 def prewarm_openai_connection(call_sid: str) -> None:
