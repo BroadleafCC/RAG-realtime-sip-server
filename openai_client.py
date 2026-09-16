@@ -55,13 +55,28 @@ FAX_NUMBER_TOOL = {
 }
 
 
+ENTER_STANDBY_TOOL = {
+    "type": "function",
+    "name": "enter_standby_mode",
+    "description": (
+        "お客様が「システム操作の時間が欲しい」「少し試してみたい」等、"
+        "こちらからの発話を待たず少し時間が欲しいと言った場合にのみ呼び出す。"
+        "引数は不要。何も話さずこの関数だけを呼び出し、実行後の案内文は"
+        "あなた自身の声で続けて話すこと（会話フローの指示に従う）。"
+        "戻り値のstatusが'limit_reached'の場合、延長の上限に達しているため、"
+        "これ以上待機を続けさせず通常の受付終了フローに進めること。"
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+
 def build_session_update(instructions: str) -> dict:
     return {
         "type": "session.update",
         "session": {
             "type": "realtime",
             "instructions": instructions,
-            "tools": [FAX_NUMBER_TOOL, SEARCH_FAQ_TOOL],
+            "tools": [FAX_NUMBER_TOOL, SEARCH_FAQ_TOOL, ENTER_STANDBY_TOOL],
             "tool_choice": "auto",
             "audio": {
                 "input": {

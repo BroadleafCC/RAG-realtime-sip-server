@@ -33,7 +33,7 @@ import twilio_client
 import watchdogs
 from agent_search import SEARCH_FAQ_TOOL
 from audio_convert import ulaw_to_pcm16
-from openai_client import FAX_NUMBER_TOOL, GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
+from openai_client import ENTER_STANDBY_TOOL, FAX_NUMBER_TOOL, GREETING_TEXT, OpenAiRealtimeSocket, log_session_echo
 from vad import TurnDetector, VadEvent, VadState, VadTransition
 from vad_model import SileroVad
 
@@ -223,6 +223,17 @@ class CallSession:
         # だけ再送してもモデルが回復できない」問題を防ぐ。
         self.pending_tool_call_id: str | None = None
 
+        # 待機モード（enter_standby_mode）用の状態。
+        # standby_checkpoint_at / standby_deadline は共に time.monotonic() 基準の
+        # 絶対時刻。チェックイン発話でsilence_anchorがリセットされても
+        # standby_deadlineは動かさないため、チェックインの成否に関わらず
+        # 開始から必ずSTANDBY_TIMEOUT_SEC秒で区切られる（watchdogs.standby_watchdog参照）。
+        self.standby_active = False
+        self.standby_checkpoint_done = False
+        self.standby_checkpoint_at: float | None = None
+        self.standby_deadline: float | None = None
+        self.standby_entries_used = 0
+
 
 async def run(twilio_ws):
     session = CallSession()
@@ -264,6 +275,7 @@ async def run(twilio_ws):
             tg.create_task(pump_openai_to_twilio(session, twilio_ws))
             tg.create_task(watchdogs.silence_watchdog(session))
             tg.create_task(watchdogs.max_duration_watchdog(session))
+            tg.create_task(watchdogs.standby_watchdog(session))
             tg.create_task(watchdogs.response_watchdog(session))
             tg.create_task(watchdogs.media_starvation_watchdog(session))
             tg.create_task(watchdogs.media_rate_reporter(session))
@@ -438,6 +450,13 @@ async def _handle_vad_event(session: CallSession, twilio_ws, transition: VadTran
         _refresh_silence_eligibility(session, reason="speech")
 
     elif event == VadEvent.END_OF_SPEECH:
+        if session.standby_active:
+            logger.info(
+                "[STANDBY] 発話を検知したため待機モードを解除します call_sid=%s",
+                session.call_sid,
+            )
+            session.standby_active = False
+            session.standby_checkpoint_done = False
         if not session._openai_ready.is_set():
             # OpenAI接続がまだ準備できていない（改善指示書「挨拶即時再生」
             # 3章）。接続完了後、openai_connection_taskがキューflush直後に
@@ -679,6 +698,25 @@ async def _handle_function_call(session: CallSession, twilio_ws, item: dict) -> 
                 # （バージイン時のclear処理と同じ考え方）。
                 await twilio_client.send_clear(twilio_ws, session.stream_sid)
                 session.ai_is_speaking = False
+        elif name == ENTER_STANDBY_TOOL["name"]:
+            if session.standby_entries_used >= config.STANDBY_MAX_ENTRIES:
+                logger.info(
+                    "[STANDBY] 延長上限(%d回)に達したため待機モードを開始しません call_sid=%s",
+                    config.STANDBY_MAX_ENTRIES, session.call_sid,
+                )
+                output = json.dumps({"status": "limit_reached"}, ensure_ascii=False)
+            else:
+                session.standby_entries_used += 1
+                session.standby_active = True
+                session.standby_checkpoint_done = False
+                now = time.monotonic()
+                session.standby_checkpoint_at = now + config.STANDBY_CHECKPOINT_SEC
+                session.standby_deadline = now + config.STANDBY_TIMEOUT_SEC
+                logger.info(
+                    "[STANDBY] 待機モード開始 (%d/%d回目) call_sid=%s",
+                    session.standby_entries_used, config.STANDBY_MAX_ENTRIES, session.call_sid,
+                )
+                output = json.dumps({"status": "ok"}, ensure_ascii=False)
         else:
             logger.warning("[TOOL] 未知の関数呼び出し name=%s call_id=%s", name, call_id)
             output = "{}"
