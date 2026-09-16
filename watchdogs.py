@@ -73,10 +73,6 @@ async def silence_watchdog(session):
     while True:
         await asyncio.sleep(1)
 
-        if session.standby_active:
-            # 待機モード中は専用のstandby_watchdogがタイムアウトを管理する。
-            continue
-
         if not session.greeting_done or session.ai_is_speaking:
             continue
         if session.turn_detector.state != VadState.IDLE:
@@ -254,52 +250,3 @@ async def media_rate_reporter(session):
         t = time.monotonic() - session.stream_started_mono
         logger.info("[MEDIA-RATE] t=+%.0fs frames_last=%d total=%d", t, total - prev, total)
         prev = total
-
-
-async def standby_watchdog(session):
-    """待機モード（call_session._handle_function_callのenter_standby_mode）
-    専用の二段階タイムアウト監視。standby_active でない間は何もしない独立
-    ループ（response_watchdogと同じ二段階方式を踏襲）。他のどの状態にも
-    依存しない独立ループという設計原則もこれに合わせる。
-
-    stage 1 (45秒、STANDBY_CHECKPOINT_SEC): チェックイン発話をモデルに
-    生成させる。OpenAIが応答しない場合は既存のresponse_watchdogの縮退運転
-    （5秒+5秒）がそのまま安全網として機能する（response_deadlineをここで
-    設定するのはそのため）。
-
-    stage 2 (60秒、STANDBY_TIMEOUT_SEC、絶対時刻): チェックイン発話の成否に
-    関わらず、standby_deadlineに達したら通常の無音タイムアウトと同じ
-    事前録音クリップ（_play_goodbye_clip）で案内・切電する。"""
-    while True:
-        await asyncio.sleep(1)
-        if not session.standby_active or session.standby_deadline is None:
-            continue
-        if not session.greeting_done or session.ai_is_speaking:
-            continue
-        if session.turn_detector.state != VadState.IDLE:
-            continue
-
-        now = time.monotonic()
-
-        if not session.standby_checkpoint_done and session.standby_checkpoint_at is not None \
-                and now >= session.standby_checkpoint_at:
-            session.standby_checkpoint_done = True
-            logger.info("[STANDBY] チェックイン発話をトリガーします call_sid=%s", session.call_sid)
-            try:
-                await session.openai.send_text_turn(config.STANDBY_CHECKPOINT_TRIGGER_TEXT)
-                session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
-                session.response_watchdog_stage = 0
-            except Exception as e:
-                logger.warning("[STANDBY] チェックイン発話の送信に失敗しました: %s", e)
-            continue
-
-        if now >= session.standby_deadline:
-            logger.info(
-                "[STANDBY] 待機モード最大時間(%s秒)に到達したため通話を切断します",
-                config.STANDBY_TIMEOUT_SEC,
-            )
-            session.transcript_lines.append("(待機モードのタイムアウトのため通話を切断しました)")
-            await _play_goodbye_clip(session, config.SILENCE_GOODBYE_AUDIO_PATH)
-            twilio_client.hangup_call(session.call_sid)
-            call_logger.log_event(session.call_sid, session.caller_number, 'standby_timeout', 'SUCCESS')
-            raise CallEnded("standby_timeout")

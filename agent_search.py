@@ -113,15 +113,9 @@ def _get_access_token() -> str:
 
 
 def _search_faq_sync(query: str) -> str:
-    """Discovery Engine（Vertex AI Search）のsearchメソッドを同期呼び出しし、
-    最も関連度の高い1件のドキュメントが指すGCS上のtxtファイルを、
-    そのままの中身で返す。asyncio.to_threadでオフロードして呼ばれる前提
-    （既存のsalesforce_case呼び出しと同じパターン。call_session.py参照）。
-
-    以前はanswerメソッド（生成AIによる複数ドキュメントの要約）を使っていたが、
-    無関係な内容が混ざる・フォーマットが安定しないという問題があったため、
-    素の検索結果1件をそのままGCSから読み込む方式に変更した
-    （claude_code_instructions_agent_search_fix.md）。"""
+    """Discovery Engine（Vertex AI Search）のanswerメソッドを同期呼び出しする。
+    asyncio.to_threadでオフロードして呼ばれる前提（既存のsalesforce_case呼び出し
+    と同じパターン。call_session.py参照）。"""
     if not config.AGENTSEARCH_PROJECT_ID or not config.AGENTSEARCH_ENGINE_ID:
         raise AgentSearchError("AGENTSEARCH_PROJECT_ID / AGENTSEARCH_ENGINE_ID が未設定です")
 
@@ -130,11 +124,11 @@ def _search_faq_sync(query: str) -> str:
         f"{DISCOVERY_ENGINE_API_BASE}/projects/{config.AGENTSEARCH_PROJECT_ID}"
         f"/locations/{config.AGENTSEARCH_LOCATION}/collections/default_collection"
         f"/engines/{config.AGENTSEARCH_ENGINE_ID}"
-        f"/servingConfigs/default_search:search"
+        f"/servingConfigs/default_search:answer"
     )
     payload = {
-        "query": query,
-        "pageSize": 1,
+        "query": {"text": query},
+        "answerGenerationSpec": {"ignoreAdversarialQuery": True},
     }
 
     started = time.monotonic()
@@ -163,33 +157,11 @@ def _search_faq_sync(query: str) -> str:
     data = resp.json()
     logger.debug("[AGENTSEARCH] raw response=%s", json.dumps(data, ensure_ascii=False)[:2000])
 
-    results = data.get("results") or []
-    if not results:
-        raise AgentSearchError("AgentSearchの検索結果が0件でした")
+    answer_text = (data.get("answer") or {}).get("answerText")
+    if not answer_text:
+        raise AgentSearchError("AgentSearchのレスポンスにanswerTextが含まれていません")
 
-    doc = results[0].get("document") or {}
-    struct_data = doc.get("derivedStructData") or {}
-    gcs_uri = struct_data.get("link")
-    if not gcs_uri or not gcs_uri.startswith("gs://"):
-        logger.warning(
-            "[AGENTSEARCH] link(gcs_uri)が取得できませんでした doc=%s",
-            json.dumps(doc, ensure_ascii=False)[:1000],
-        )
-        raise AgentSearchError("検索結果からGCSのURIを取得できませんでした")
-
-    return _fetch_gcs_text(gcs_uri)
-
-
-def _fetch_gcs_text(gcs_uri: str) -> str:
-    """gs://bucket/path 形式のURIから、txtファイルの中身をそのまま取得する。
-    ADCの認証情報をそのままStorageクライアントに使い回す。
-    このサービスアカウントにバケットのStorage Object Viewer権限が必要。"""
-    from google.cloud import storage
-
-    bucket_name, _, blob_path = gcs_uri.removeprefix("gs://").partition("/")
-    client = storage.Client()
-    blob = client.bucket(bucket_name).blob(blob_path)
-    return blob.download_as_text(encoding="utf-8")
+    return answer_text
 
 
 async def search_faq(query: str) -> str:

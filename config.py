@@ -129,15 +129,3 @@ DEBUG_DROP_MEDIA_AFTER_SEC = _float("DEBUG_DROP_MEDIA_AFTER_SEC", 0.0)
 # 受信フレームレートのログ間隔（秒）。0で無効。再現キャンペーン中は1、
 # キャンペーン終了後は5に上げるか0で無効化する。
 MEDIA_RATE_LOG_INTERVAL_SEC = _float("MEDIA_RATE_LOG_INTERVAL_SEC", 1.0)
-
-# 待機モード（enter_standby_mode、システム操作の時間が欲しいと言われた場合）の
-# タイムアウト設定。通常の無音タイムアウト(SILENCE_TIMEOUT_SEC)とは独立して
-# 動作する（watchdogs.standby_watchdog参照。silence_watchdogは待機モード中は
-# 自身を抑止する）。
-STANDBY_CHECKPOINT_SEC = _int("STANDBY_CHECKPOINT_SEC", 45)
-STANDBY_TIMEOUT_SEC = _int("STANDBY_TIMEOUT_SEC", 60)
-# 初回のenter_standby_mode呼び出し1回+延長2回=合計3回まで許可する
-STANDBY_MAX_ENTRIES = _int("STANDBY_MAX_ENTRIES", 3)
-# 45秒チェックイン時にモデルへ送るトリガーメッセージ。プロンプト側の
-# 「【待機45秒経過】というメッセージが届いたら...」の記述と文言を必ず一致させること。
-STANDBY_CHECKPOINT_TRIGGER_TEXT = os.getenv("STANDBY_CHECKPOINT_TRIGGER_TEXT", "【待機45秒経過】")

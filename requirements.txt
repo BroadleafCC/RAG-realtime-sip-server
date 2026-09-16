@@ -13,4 +13,3 @@ silero-vad-notorch
 audioop-lts; python_version >= "3.13"
 numpy
 google-auth
-google-cloud-storage
