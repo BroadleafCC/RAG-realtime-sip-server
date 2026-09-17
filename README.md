@@ -27,6 +27,7 @@ python tests/test_audio_convert.py
 python tests/test_twilio_framing.py
 python tests/test_call_session_prewarm.py
 python tests/test_barge_in.py
+python tests/test_standby_mode.py
 ```
 
 ## ローカル起動 + ngrok動作確認
