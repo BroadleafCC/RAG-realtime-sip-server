@@ -141,3 +141,23 @@ STANDBY_MAX_ENTRIES = _int("STANDBY_MAX_ENTRIES", 3)
 # 45秒チェックイン時にモデルへ送るトリガーメッセージ。プロンプト側の
 # 「【待機45秒経過】というメッセージが届いたら...」の記述と文言を必ず一致させること。
 STANDBY_CHECKPOINT_TRIGGER_TEXT = os.getenv("STANDBY_CHECKPOINT_TRIGGER_TEXT", "【待機45秒経過】")
+
+# Smart Turn v3（発話終端検出モデル）。無音がVAD_SPEECH_END_MSに達するのを
+# 待たずに、発話内容(音響的特徴)から「言い切ったか」を推論して早期に
+# END_OF_SPEECHを発火させる。推論失敗/タイムアウト/incomplete判定時は
+# 何もせず、既存のVAD_SPEECH_END_MS固定閾値にそのままフォールバックする
+# （smart-turn-integration-instructions.md 参照。ただし同指示書の
+# 「mode=default/longformの2モード」は本システムに存在しないため、
+# 上限値は単一のVAD_SPEECH_END_MSのみを使う）。
+SMART_TURN_ENABLED = os.getenv("SMART_TURN_ENABLED", "false").strip().lower() == "true"
+# シャドーモード: 推論結果を[SMART-TURN]ログに出すだけで、実際の
+# END_OF_SPEECH発火タイミングには反映しない。実通話で精度を確認してから
+# falseに切り替える運用を想定（ロールアウト計画1〜2章）。
+SMART_TURN_SHADOW_MODE = os.getenv("SMART_TURN_SHADOW_MODE", "true").strip().lower() == "true"
+SMART_TURN_COMPLETE_THRESHOLD = _float("SMART_TURN_COMPLETE_THRESHOLD", 0.7)
+SMART_TURN_INFER_TIMEOUT_MS = _int("SMART_TURN_INFER_TIMEOUT_MS", 200)
+# 無音開始からこの時間が経過した最初のフレームで推論を1回だけキックする。
+# VAD_SPEECH_END_MSより十分小さい値にすること（起動時にチェックする）。
+SMART_TURN_TRIGGER_SILENCE_MS = _int("SMART_TURN_TRIGGER_SILENCE_MS", 200)
+SMART_TURN_MAX_BUFFER_SEC = _float("SMART_TURN_MAX_BUFFER_SEC", 8.0)
+SMART_TURN_MODEL_PATH = os.getenv("SMART_TURN_MODEL_PATH", "assets/models/smart-turn-v3.2-cpu.onnx")

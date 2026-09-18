@@ -29,6 +29,7 @@ import agent_search
 import call_logger
 import config
 import salesforce_case
+import smart_turn_model
 import twilio_client
 import watchdogs
 from agent_search import SEARCH_FAQ_TOOL
@@ -38,6 +39,13 @@ from vad import TurnDetector, VadEvent, VadState, VadTransition
 from vad_model import SileroVad
 
 logger = logging.getLogger("call_session")
+
+if config.SMART_TURN_ENABLED and config.SMART_TURN_TRIGGER_SILENCE_MS >= config.VAD_SPEECH_END_MS:
+    logger.warning(
+        "[SMART-TURN] SMART_TURN_TRIGGER_SILENCE_MS(%dms) >= VAD_SPEECH_END_MS(%dms) のため、"
+        "早期発火の猶予がありません。設定を見直してください。",
+        config.SMART_TURN_TRIGGER_SILENCE_MS, config.VAD_SPEECH_END_MS,
+    )
 
 # 相槌（ENABLE_FILLER=true時）の直後にモデルが同じ相槌を言い直して二重発声する
 # のを防ぐための追加ルール。プロンプトDBの内容に関わらず、フィラー機能が有効な
@@ -167,6 +175,18 @@ class CallSession:
         self.silero = SileroVad()
         self.openai: OpenAiRealtimeSocket | None = None
         self._response_id: str | None = None
+
+        # Smart Turn v3（発話終端検出モデル）用の状態（config.SMART_TURN_ENABLED=false
+        # なら未使用のまま）。1発話ターン（SPEECH_STARTEDからEND_OF_SPEECH/BARGE_IN
+        # まで）につき最大1回だけ推論をキックする。_speech_turn_generationは
+        # 「今どの発話ターン・無音区間の推論結果が有効か」を示す世代カウンタ
+        # （_mark_seqと同型のレース対策パターン、call_session.py内_handle_vad_event
+        # /pump_twilio_to_openai参照）。
+        self._smart_turn_pcm16_buf = bytearray()
+        self._smart_turn_infer_fired = False
+        self._speech_turn_generation = 0
+        self._last_silence_elapsed_ms = 0.0
+        self._smart_turn_task: asyncio.Task | None = None
 
         # バージイン時のconversation.item.truncateに使う状態（改善指示書
         # 「バージイン実装」修正1）。_current_item_idは再生中のassistant
@@ -372,7 +392,22 @@ async def pump_twilio_to_openai(session: CallSession, twilio_ws):
                         "[BARGE-IN] 抑止 speech_ms=%.0f (<%dms)",
                         session._last_barge_in_run_ms, config.BARGE_IN_MIN_MS,
                     )
+                elif (
+                    config.SMART_TURN_ENABLED
+                    and not session.ai_is_speaking
+                    and session.turn_detector.state == VadState.SPEAKING
+                ):
+                    _maybe_kick_smart_turn(session, twilio_ws, transition.elapsed_ms)
                 session._last_barge_in_run_ms = transition.elapsed_ms if session.ai_is_speaking else 0.0
+
+            if config.SMART_TURN_ENABLED and session.turn_detector.state == VadState.SPEAKING:
+                # Smart Turn推論用に発話中の生音声(8kHz PCM16)を蓄積する
+                # （SPEECH_STARTED/_fire_end_of_speechでクリアされる）。
+                session._smart_turn_pcm16_buf.extend(pcm16)
+                max_bytes = int(config.SMART_TURN_MAX_BUFFER_SEC * 8000) * 2  # PCM16=2byte/sample
+                if len(session._smart_turn_pcm16_buf) > max_bytes:
+                    overflow = len(session._smart_turn_pcm16_buf) - max_bytes
+                    del session._smart_turn_pcm16_buf[:overflow]
 
         elif event == "mark":
             mark_name = (data.get("mark") or {}).get("name", "")
@@ -444,38 +479,59 @@ def _refresh_silence_eligibility(session: CallSession, reason: str | None = None
         logger.info("[SILENCE-TIMER] 計測開始")
 
 
+async def _fire_end_of_speech(session: CallSession, twilio_ws, source: str) -> None:
+    """発話終了と判定された時に行う処理の本体。通常経路（vad.pyの確率駆動の
+    END_OF_SPEECH）とSmart Turnによる早期発火の両方から呼ばれる共通処理。
+    sourceはログ用("vad_timeout" | "smart_turn")。"""
+    session._smart_turn_pcm16_buf.clear()  # 用済みバッファを解放
+    if session.standby_active:
+        logger.info(
+            "[STANDBY] 発話を検知したため待機モードを解除します call_sid=%s (source=%s)",
+            session.call_sid, source,
+        )
+        session.standby_active = False
+        session.standby_checkpoint_done = False
+    if not session._openai_ready.is_set():
+        # OpenAI接続がまだ準備できていない（改善指示書「挨拶即時再生」
+        # 3章）。接続完了後、openai_connection_taskがキューflush直後に
+        # まとめてcommit+response.createする。
+        session._deferred_end_of_speech = True
+        logger.info("[QUEUE] 発話終了を検知しましたが接続待ちのためcommitを保留します (source=%s)", source)
+        return
+    await session.openai.commit()
+    await session.openai.response_create()
+    session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
+    session.response_watchdog_stage = 0
+    if config.ENABLE_FILLER:
+        # モデルの応答音声が生成されるまでの無音区間を埋める即時相槌
+        # （改善指示書1-b）。AWAITING_RESPONSE中はVAD状態機械が確率で
+        # 遷移しない（vad.py参照）ため、この再生はVAD/バージイン判定に
+        # 一切影響しない。
+        await _play_filler(session, twilio_ws)
+
+
 async def _handle_vad_event(session: CallSession, twilio_ws, transition: VadTransition) -> None:
     event = transition.event
     if event == VadEvent.SPEECH_STARTED:
         _refresh_silence_eligibility(session, reason="speech")
+        # 新しい発話ターンの開始。Smart Turn用バッファ・トリガーをリセットし、
+        # 前ターンの推論結果がまだ完了していなければ世代カウンタで無効化する。
+        session._smart_turn_pcm16_buf.clear()
+        session._smart_turn_infer_fired = False
+        session._last_silence_elapsed_ms = 0.0
+        session._speech_turn_generation += 1
 
     elif event == VadEvent.END_OF_SPEECH:
-        if session.standby_active:
-            logger.info(
-                "[STANDBY] 発話を検知したため待機モードを解除します call_sid=%s",
-                session.call_sid,
-            )
-            session.standby_active = False
-            session.standby_checkpoint_done = False
-        if not session._openai_ready.is_set():
-            # OpenAI接続がまだ準備できていない（改善指示書「挨拶即時再生」
-            # 3章）。接続完了後、openai_connection_taskがキューflush直後に
-            # まとめてcommit+response.createする。
-            session._deferred_end_of_speech = True
-            logger.info("[QUEUE] 発話終了を検知しましたが接続待ちのためcommitを保留します")
-        else:
-            await session.openai.commit()
-            await session.openai.response_create()
-            session.response_deadline = time.monotonic() + config.RESPONSE_WATCHDOG_FIRST_SEC
-            session.response_watchdog_stage = 0
-            if config.ENABLE_FILLER:
-                # モデルの応答音声が生成されるまでの無音区間を埋める即時相槌
-                # （改善指示書1-b）。AWAITING_RESPONSE中はVAD状態機械が確率で
-                # 遷移しない（vad.py参照）ため、この再生はVAD/バージイン判定に
-                # 一切影響しない。
-                await _play_filler(session, twilio_ws)
+        session._speech_turn_generation += 1
+        await _fire_end_of_speech(session, twilio_ws, source="vad_timeout")
 
     elif event == VadEvent.BARGE_IN:
+        # バージインはSPEECH_STARTEDを経由せず直接SPEAKINGへ遷移する
+        # （vad.py参照）ため、新しい発話ターンとして同様にリセットする。
+        session._smart_turn_pcm16_buf.clear()
+        session._smart_turn_infer_fired = False
+        session._last_silence_elapsed_ms = 0.0
+        session._speech_turn_generation += 1
         await _handle_barge_in(session, twilio_ws, transition.elapsed_ms)
 
 
@@ -534,6 +590,107 @@ async def _handle_barge_in(session: CallSession, twilio_ws, speech_ms: float) ->
 
     session._current_item_id = None
     _refresh_silence_eligibility(session)
+
+
+def _maybe_kick_smart_turn(session: CallSession, twilio_ws, elapsed_ms: float) -> None:
+    """SPEAKING状態で無音が続く毎フレーム呼ばれる。無音が
+    SMART_TURN_TRIGGER_SILENCE_MSに達した最初のフレームで、1発話ターンに
+    つき1回だけSmart Turn推論をキックする。
+
+    vad.pyは無音区間中に発話が再開されても(elapsed_msが0へ戻っても)専用の
+    イベントを出さないため、ここでelapsed_msの減少を検出して世代カウンタを
+    進め、次の無音区間で再度トリガーできるようにする（3レースのうち
+    「発話再開」に対する検出。他の2つ(自然発火/バージイン・新ターン)は
+    _handle_vad_event側の世代カウンタで検出する）。
+    """
+    if elapsed_ms < session._last_silence_elapsed_ms:
+        session._speech_turn_generation += 1
+        session._smart_turn_infer_fired = False
+    session._last_silence_elapsed_ms = elapsed_ms
+
+    if session._smart_turn_infer_fired:
+        return
+    if elapsed_ms < config.SMART_TURN_TRIGGER_SILENCE_MS:
+        return
+
+    detector = smart_turn_model.get_detector()
+    if detector is None:
+        # SMART_TURN_ENABLED=trueだが起動時ロードに失敗した、または
+        # main.pyのプリロードが未実行。1回警告して以降は静かにスキップする
+        # （現行の500ms固定ロジックには一切影響しない）。
+        session._smart_turn_infer_fired = True
+        logger.warning("[SMART-TURN] モデル未ロードのため推論をスキップします")
+        return
+
+    session._smart_turn_infer_fired = True
+    gen = session._speech_turn_generation
+    pcm16_snapshot = bytes(session._smart_turn_pcm16_buf)
+    elapsed_at_trigger = elapsed_ms
+    session._smart_turn_task = asyncio.create_task(
+        _run_smart_turn_and_maybe_fire(session, twilio_ws, detector, gen, pcm16_snapshot, elapsed_at_trigger)
+    )
+
+
+def _is_smart_turn_result_stale(session: CallSession, gen_snapshot: int) -> bool:
+    """推論キック後に(a)自然閾値到達、(b)発話再開、(c)バージイン/新ターン開始
+    のいずれかが起きていれば古い結果として扱う。世代カウンタの不一致だけで
+    (a)(b)(c)すべてを検出できる（stateの再チェックは後段防御）。"""
+    return (
+        session._speech_turn_generation != gen_snapshot
+        or session.turn_detector.state != VadState.SPEAKING
+    )
+
+
+async def _run_smart_turn_and_maybe_fire(
+    session: CallSession,
+    twilio_ws,
+    detector: "smart_turn_model.SmartTurnDetector",
+    gen: int,
+    pcm16_snapshot: bytes,
+    elapsed_at_trigger: float,
+) -> None:
+    """asyncio.create_taskでfire-and-forget起動される。pumpループはブロック
+    しない（推論はasyncio.to_threadで別スレッド実行、タイムアウト付き）。
+    推論失敗・タイムアウトは即座に現行の500ms固定ロジックへフォールバック
+    する（=何もしない。既存のEND_OF_SPEECH経路は本関数の成否に関わらず
+    生きたまま動作し続ける）。"""
+    started = time.monotonic()
+    fallback_used = False
+    probability = 0.0
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(detector.predict, pcm16_snapshot),
+            timeout=config.SMART_TURN_INFER_TIMEOUT_MS / 1000,
+        )
+        probability = result.probability
+        decision = "complete" if probability >= config.SMART_TURN_COMPLETE_THRESHOLD else "incomplete"
+    except Exception as e:
+        decision = "incomplete"
+        fallback_used = True
+        logger.warning("[SMART-TURN] 推論失敗、現行ロジックへフォールバック: %s", e)
+    infer_ms = (time.monotonic() - started) * 1000
+
+    stale = _is_smart_turn_result_stale(session, gen)
+
+    if stale or decision != "complete" or fallback_used:
+        action = "no_action"
+    elif config.SMART_TURN_SHADOW_MODE:
+        action = "shadow_only"
+    else:
+        action = "early_fire"
+
+    logger.info(
+        "[SMART-TURN] decision=%s prob=%.2f infer_ms=%.0f elapsed_ms=%.0f mode=%s "
+        "fallback_used=%s action=%s stale=%s",
+        decision, probability, infer_ms, elapsed_at_trigger,
+        "shadow" if config.SMART_TURN_SHADOW_MODE else "live", fallback_used, action, stale,
+    )
+
+    if action == "early_fire":
+        transition = session.turn_detector.force_end_of_speech()
+        if transition.event == VadEvent.END_OF_SPEECH:
+            session._speech_turn_generation += 1
+            await _fire_end_of_speech(session, twilio_ws, source="smart_turn")
 
 
 async def _play_filler(session: CallSession, twilio_ws) -> None:

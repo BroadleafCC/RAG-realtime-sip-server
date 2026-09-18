@@ -12,6 +12,7 @@ import admin
 import call_logger
 import call_session
 import config
+import smart_turn_model
 from salesforce_case import link_serializer
 
 # Windows上のローカル開発では既定のstdout/stderrエンコーディングがUTF-8で
@@ -31,6 +32,10 @@ async def lifespan(app: FastAPI):
     call_logger.init_db()
     call_logger.cleanup_old_logs()
     call_session.preload_static_clips()
+    if config.SMART_TURN_ENABLED:
+        # SMART_TURN_ENABLED=falseの場合はロード自体を完全にスキップする
+        # （起動コスト・メモリともゼロ、即座に切り戻せるキルスイッチ）。
+        smart_turn_model.preload(config.SMART_TURN_MODEL_PATH)
     yield
 
 

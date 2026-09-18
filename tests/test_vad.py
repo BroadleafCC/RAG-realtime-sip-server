@@ -98,6 +98,33 @@ def test_barge_in_fires_once_per_ai_turn():
     assert t.event == VadEvent.BARGE_IN
 
 
+def test_force_end_of_speech_transitions_from_speaking():
+    d = TurnDetector(threshold=0.5, speech_start_ms=250, speech_end_ms=650, barge_in_min_ms=500)
+    feed(d, 0.9, 8)
+    assert d.state == VadState.SPEAKING
+    feed(d, 0.1, 5)  # 160ms分の無音だけ積んでおく(650msには届かない)
+    t = d.force_end_of_speech()
+    assert t.event == VadEvent.END_OF_SPEECH
+    assert d.state == VadState.AWAITING_RESPONSE
+    assert t.elapsed_ms == 160.0
+
+
+def test_force_end_of_speech_is_noop_outside_speaking():
+    d = TurnDetector(threshold=0.5, speech_start_ms=250, speech_end_ms=650, barge_in_min_ms=500)
+    # IDLE状態
+    t = d.force_end_of_speech()
+    assert t.event is None
+    assert d.state == VadState.IDLE
+
+    # AWAITING_RESPONSE状態
+    feed(d, 0.9, 8)
+    feed(d, 0.1, 21)
+    assert d.state == VadState.AWAITING_RESPONSE
+    t = d.force_end_of_speech()
+    assert t.event is None
+    assert d.state == VadState.AWAITING_RESPONSE
+
+
 def test_barge_in_never_fires_while_ai_silent():
     d = TurnDetector(threshold=0.5, speech_start_ms=250, speech_end_ms=650, barge_in_min_ms=500)
     t = feed(d, 0.9, 100, ai_is_speaking=False)

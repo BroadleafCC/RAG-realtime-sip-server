@@ -64,6 +64,19 @@ class TurnDetector:
         self._barge_in_run_ms = 0.0
         self._barge_in_fired = False
 
+    def force_end_of_speech(self) -> VadTransition:
+        """確率以外のシグナル(Smart Turn等)により早期に発話終了と判定された
+        場合にのみ呼ぶ。SPEAKING状態でのみ有効。それ以外の状態(既に
+        AWAITING_RESPONSEへ自然遷移済み、IDLEに戻った等)で呼ばれた場合は
+        何もせず、eventなしのVadTransitionを返す(呼び出し側のレース検知が
+        漏れた場合の後段防御)。"""
+        if self.state != VadState.SPEAKING:
+            return VadTransition(None, self.state, 0.0, 0.0)
+        elapsed = self._silence_run_ms
+        self.state = VadState.AWAITING_RESPONSE
+        self._silence_run_ms = 0.0
+        return VadTransition(VadEvent.END_OF_SPEECH, self.state, 0.0, elapsed)
+
     def update(self, prob: float, frame_ms: float, ai_is_speaking: bool) -> VadTransition:
         is_speech = prob >= self.threshold
 
